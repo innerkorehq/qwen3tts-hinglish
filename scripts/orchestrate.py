@@ -27,6 +27,11 @@ just an optional live-progress view + an idempotent backstop destroy for cases
 the instance itself can't handle (--timeout-hours, a dead/offline instance).
 See docs/RUNBOOK.md "Self-destruct and handoff".
 
+Ctrl-C only stops *local polling* -- it does NOT destroy the instance (the
+remote pipeline and its self-destruct trap keep running independently). Use
+`--attach INSTANCE_ID` to re-attach polling to an already-running instance
+(e.g. after Ctrl-C, or from a different machine).
+
 Only final and important intermediary artifacts (raw manifests, resampled audio,
 encoded codes, checkpoint variants, logs) go to R2 -- /root/work is scratch space
 for the run and disappears with the instance.
@@ -555,6 +560,11 @@ def main():
                          "for that stage's output first and downloads it instead of "
                          "recomputing if present (see docs/RUNBOOK.md 'Resuming a failed run')")
     ap.add_argument("--dry-run", action="store_true", help="search and show offer only, don't create")
+    ap.add_argument("--attach", type=int, default=None, metavar="INSTANCE_ID",
+                    help="re-attach polling to an already-running instance instead of "
+                         "creating a new one -- use this after Ctrl-C'ing a previous run "
+                         "(Ctrl-C only stops local polling; the remote pipeline and its "
+                         "self-destruct trap keep running independently)")
     args = ap.parse_args()
 
     for var in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
@@ -562,53 +572,60 @@ def main():
             print(f"ERROR: {var} not set", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Searching for {args.gpu} offers under ${args.max_price}/hr "
-          f"with >= {args.disk}GB disk ...")
-    offers = search_offers(args.max_price, args.disk, gpu=args.gpu)
-    best = offers[0]
-    print(f"\\nTop {min(5, len(offers))} offers:")
-    for o in offers[:5]:
-        print(f"  id={o['id']} ${o['dph_total']:.3f}/hr "
-              f"reliability={o.get('reliability', 0):.3f} "
-              f"disk={o.get('disk_space')}GB "
-              f"loc={o.get('geolocation','?')}")
-
-    print(f"\\nSelected offer id={best['id']} at ${best['dph_total']:.3f}/hr")
-
-    if args.dry_run:
-        print("\\n--dry-run set, not creating instance.")
-        return
-
-    onstart_path = Path("/tmp/onstart.sh")
-    onstart_path.write_text(build_onstart_script(
-        slr104_pairs=args.slr104_pairs,
-        slr104_include_test=args.slr104_include_test,
-        eval_frac=args.eval_frac,
-        resume=args.resume,
-    ))
-    print(f"\\nGenerated onstart script -> {onstart_path}")
-    if args.resume:
-        print("--resume set: each stage will check R2 for prior outputs before recomputing.")
-
-    print("\\nCreating instance ...")
     instance_id = None
     final_status = None
     self_destructed = False
 
-    try:
-        instance_id = create_instance(best["id"], args.disk, onstart_path)
-        print(f"Instance created: id={instance_id}")
-
-        ssh_pubkey_path = os.environ.get("VAST_SSH_PUBKEY_PATH")
-        if ssh_pubkey_path:
-            print(f"Attaching SSH key from {ssh_pubkey_path} ...")
-            attach_ssh_key(instance_id, ssh_pubkey_path)
-            run(["vastai", "ssh-url", str(instance_id)], check=False)
-            print("(use the URL above to SSH in manually and inspect /root/pipeline.log)")
-        else:
-            print("VAST_SSH_PUBKEY_PATH not set -- skipping manual SSH access setup.")
-        print("Pipeline is now running in the background via onstart script.")
+    if args.attach is not None:
+        instance_id = args.attach
+        print(f"Re-attaching to instance {instance_id} -- skipping offer search/creation.")
         print("Polling for completion ...")
+    else:
+        print(f"Searching for {args.gpu} offers under ${args.max_price}/hr "
+              f"with >= {args.disk}GB disk ...")
+        offers = search_offers(args.max_price, args.disk, gpu=args.gpu)
+        best = offers[0]
+        print(f"\\nTop {min(5, len(offers))} offers:")
+        for o in offers[:5]:
+            print(f"  id={o['id']} ${o['dph_total']:.3f}/hr "
+                  f"reliability={o.get('reliability', 0):.3f} "
+                  f"disk={o.get('disk_space')}GB "
+                  f"loc={o.get('geolocation','?')}")
+
+        print(f"\\nSelected offer id={best['id']} at ${best['dph_total']:.3f}/hr")
+
+        if args.dry_run:
+            print("\\n--dry-run set, not creating instance.")
+            return
+
+        onstart_path = Path("/tmp/onstart.sh")
+        onstart_path.write_text(build_onstart_script(
+            slr104_pairs=args.slr104_pairs,
+            slr104_include_test=args.slr104_include_test,
+            eval_frac=args.eval_frac,
+            resume=args.resume,
+        ))
+        print(f"\\nGenerated onstart script -> {onstart_path}")
+        if args.resume:
+            print("--resume set: each stage will check R2 for prior outputs before recomputing.")
+
+        print("\\nCreating instance ...")
+
+    try:
+        if args.attach is None:
+            instance_id = create_instance(best["id"], args.disk, onstart_path)
+            print(f"Instance created: id={instance_id}")
+
+            ssh_pubkey_path = os.environ.get("VAST_SSH_PUBKEY_PATH")
+            if ssh_pubkey_path:
+                print(f"Attaching SSH key from {ssh_pubkey_path} ...")
+                attach_ssh_key(instance_id, ssh_pubkey_path)
+                run(["vastai", "ssh-url", str(instance_id)], check=False)
+                print("(use the URL above to SSH in manually and inspect /root/pipeline.log)")
+            else:
+                print("VAST_SSH_PUBKEY_PATH not set -- skipping manual SSH access setup.")
+            print("Pipeline is now running in the background via onstart script.")
+            print("Polling for completion ...")
 
         start = time.time()
         timeout_sec = args.timeout_hours * 3600
@@ -656,8 +673,20 @@ def main():
             time.sleep(args.poll_interval)
 
     except KeyboardInterrupt:
-        print("\\nInterrupted by user.")
-        final_status = "INTERRUPTED"
+        # Total handoff: Ctrl-C only stops *local polling*. The remote
+        # pipeline (and its own cleanup trap / self-destruct) keeps running
+        # independently via the onstart script -- do NOT destroy the
+        # instance here, or the whole point of "fire and forget" is lost.
+        print("\\n\\nInterrupted (Ctrl-C) -- this only stops local polling.")
+        print("The remote pipeline keeps running and will self-destruct on its own")
+        print("(success or failure) via its cleanup trap. The instance is NOT being destroyed.")
+        if instance_id is not None:
+            print(f"\\nRe-attach polling later with:")
+            print(f"  python3 {sys.argv[0]} --attach {instance_id}")
+            print(f"\\nOr check status without polling:")
+            print(f"  vastai show instance {instance_id} --raw")
+            print(f"  (or check {R2_PREFIX}/logs/status.txt in R2 once it finishes)")
+        return
 
     except RuntimeError as e:
         print(f"\\nERROR: {e}")
@@ -688,7 +717,8 @@ def main():
         # the-instance's-perspective, or an unexpected crash/signal) -- see
         # build_onstart_script's "Self-destruct and handoff". This call covers
         # the remaining cases where the orchestrator itself decides to give up
-        # (--timeout-hours, INSTANCE_EXITED/OFFLINE, Ctrl-C, provisioning error).
+        # (--timeout-hours, INSTANCE_EXITED/OFFLINE, provisioning error). Note:
+        # Ctrl-C (KeyboardInterrupt) returns earlier above and never reaches here.
         print(f"\\nDestroying instance {instance_id} (if not already self-destructed) ...")
         destroy_instance(instance_id)
         print("Done. Billing stopped, container disk destroyed with the instance.")

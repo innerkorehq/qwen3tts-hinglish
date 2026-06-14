@@ -265,9 +265,32 @@ runs `cleanup()` on **every** exit path — normal completion, any
 All of this is **idempotent and best-effort** (`|| true` everywhere except the
 final destroy): if R2 is unreachable, the instance still self-destructs (cost
 control wins); if `vastai` itself somehow isn't usable, the orchestrator's own
-`destroy_instance()` call (run unconditionally at the end of `main()`, `-y`,
-`check=False`) is a harmless backstop — destroying an already-destroyed
-instance just fails quietly.
+`destroy_instance()` call is a harmless backstop — destroying an
+already-destroyed instance just fails quietly.
+
+### Ctrl-C / re-attaching
+
+`Ctrl-C` (or closing the terminal) only stops **local polling** — the
+orchestrator does **not** destroy the instance in this case, since that would
+defeat the point of the handoff. The remote pipeline and its `cleanup()` trap
+above keep running and will self-destruct on their own when the run finishes.
+
+To resume watching an existing run (from this machine or another), use:
+
+```bash
+python3 scripts/orchestrate.py --attach INSTANCE_ID
+```
+
+This skips offer search/creation and goes straight to polling
+`vastai show instance` / the `/root/DONE` marker for that instance, with the
+same `--timeout-hours`/`--poll-interval` and the same end-of-run backstop
+destroy for `TIMEOUT`/`INSTANCE_EXITED`/`INSTANCE_OFFLINE`. Find the instance
+id from the `Instance created: id=...` line printed at creation time, or via
+`vastai show instances-v1 --raw`.
+
+Only the orchestrator's own give-up paths (`--timeout-hours`,
+`INSTANCE_EXITED`/`INSTANCE_OFFLINE`, provisioning errors) trigger the
+backstop `destroy_instance()` call — Ctrl-C never does.
 
 **Checkpoint uploads get retries, not silent loss**: `FAILED_UPLOAD_MODEL`
 (step 8) retries each of `final_fp32`/`final_bf16`/`final_fp16` up to 3 times
