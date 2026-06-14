@@ -27,12 +27,18 @@ Usage (existence check, for resume -- exit 0 if present, 1 if missing):
 import argparse
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
 from net_utils import r2_boto_config, retry
+
+DEFAULT_CONCURRENCY = 16
+
+_thread_local = threading.local()
 
 
 def get_client():
@@ -84,48 +90,85 @@ def ensure_bucket(client, bucket):
             print(f"WARNING: could not create bucket '{bucket}': {e}", file=sys.stderr)
 
 
-def upload_file(client, bucket, local_path, key):
-    size_mb = os.path.getsize(local_path) / (1 << 20)
-    print(f"Uploading {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{key}")
+def upload_file(client, bucket, local_path, key, quiet=False):
+    if not quiet:
+        size_mb = os.path.getsize(local_path) / (1 << 20)
+        print(f"Uploading {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{key}")
     retry(client.upload_file, str(local_path), bucket, key,
           what=f"upload {key}")
 
 
-def upload_dir(client, bucket, local_dir, key_prefix):
+def _thread_client():
+    """One boto3 client per worker thread -- clients aren't guaranteed safe
+    to share across threads, and a fresh connection pool per thread avoids
+    contention under concurrent transfers."""
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = get_client()
+        _thread_local.client = client
+    return client
+
+
+def upload_dir(client, bucket, local_dir, key_prefix, concurrency=DEFAULT_CONCURRENCY):
     local_dir = Path(local_dir)
     files = list(local_dir.rglob("*"))
     files = [f for f in files if f.is_file()]
-    print(f"Uploading {len(files)} files from {local_dir} -> s3://{bucket}/{key_prefix}/")
-    for f in files:
+    print(f"Uploading {len(files)} files from {local_dir} -> s3://{bucket}/{key_prefix}/ "
+          f"({concurrency} parallel) ...")
+
+    def _upload_one(f):
         rel = f.relative_to(local_dir)
         key = f"{key_prefix}/{rel.as_posix()}"
-        retry(client.upload_file, str(f), bucket, key, what=f"upload {key}")
-        print(f"  {rel} -> {key}")
+        upload_file(_thread_client(), bucket, f, key, quiet=True)
+        return rel, key
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = [ex.submit(_upload_one, f) for f in files]
+        for fut in as_completed(futures):
+            rel, key = fut.result()
+            done += 1
+            print(f"  [{done}/{len(files)}] {rel} -> {key}")
 
 
-def download_file(client, bucket, key, local_path):
+def download_file(client, bucket, key, local_path, quiet=False):
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading s3://{bucket}/{key} -> {local_path}")
+    if not quiet:
+        print(f"Downloading s3://{bucket}/{key} -> {local_path}")
     retry(client.download_file, bucket, key, str(local_path),
           what=f"download {key}")
 
 
-def download_dir(client, bucket, key_prefix, local_dir):
+def download_dir(client, bucket, key_prefix, local_dir, concurrency=DEFAULT_CONCURRENCY):
     """Recursively download all objects under key_prefix to local_dir, preserving structure."""
     local_dir = Path(local_dir)
     prefix = key_prefix.rstrip("/") + "/"
     paginator = client.get_paginator("list_objects_v2")
-    count = 0
+    keys = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel = key[len(prefix):]
             if not rel:  # skip the "directory marker" object itself
                 continue
-            dest = local_dir / rel
-            download_file(client, bucket, key, dest)
-            count += 1
-    print(f"Downloaded {count} files from s3://{bucket}/{prefix} -> {local_dir}")
+            keys.append((key, local_dir / rel))
+
+    print(f"Downloading {len(keys)} files from s3://{bucket}/{prefix} -> {local_dir} "
+          f"({concurrency} parallel) ...")
+
+    def _download_one(key, dest):
+        download_file(_thread_client(), bucket, key, dest, quiet=True)
+        return key, dest
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = [ex.submit(_download_one, key, dest) for key, dest in keys]
+        for fut in as_completed(futures):
+            key, dest = fut.result()
+            done += 1
+            print(f"  [{done}/{len(keys)}] {key} -> {dest}")
+
+    print(f"Downloaded {len(keys)} files from s3://{bucket}/{prefix} -> {local_dir}")
 
 
 def object_exists(client, bucket, key):
@@ -160,6 +203,8 @@ def main():
     ap.add_argument("--exists", action="store_true",
                     help="check whether --key (or --key prefix if --recursive) exists; "
                          "prints EXISTS/MISSING and exits 0/1, no --file needed")
+    ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                    help=f"parallel transfers for --recursive (default {DEFAULT_CONCURRENCY})")
     args = ap.parse_args()
 
     if not args.bucket:
@@ -181,11 +226,11 @@ def main():
 
     if args.download:
         if args.recursive:
-            download_dir(client, args.bucket, args.key, args.file)
+            download_dir(client, args.bucket, args.key, args.file, concurrency=args.concurrency)
         else:
             download_file(client, args.bucket, args.key, args.file)
     elif args.recursive:
-        upload_dir(client, args.bucket, args.file, args.key)
+        upload_dir(client, args.bucket, args.file, args.key, concurrency=args.concurrency)
     else:
         upload_file(client, args.bucket, args.file, args.key)
 
