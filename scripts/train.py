@@ -47,8 +47,11 @@ def _r2_client_and_bucket():
     if not all(os.environ.get(v) for v in
                ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")):
         return None, None
-    from upload_to_r2 import get_client
-    return get_client(), os.environ["R2_BUCKET"]
+    from upload_to_r2 import ensure_bucket, get_client
+    client = get_client()
+    bucket = os.environ["R2_BUCKET"]
+    ensure_bucket(client, bucket)
+    return client, bucket
 
 
 def upload_resume_state(accel_state_dir, state_path, best_dir=None):

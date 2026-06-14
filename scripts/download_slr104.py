@@ -28,9 +28,12 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 import soundfile as sf
+
+from net_utils import download_with_retry
 
 BASE_URL = "https://openslr.trmal.net/resources/104"
 
@@ -48,24 +51,38 @@ ARCHIVES = {
 }
 
 
-def download_file(url, dest_path):
+def download_file(url, dest_path, max_attempts=6):
     if dest_path.exists():
         print(f"  already exists, skipping download: {dest_path.name}")
         return
     print(f"  downloading {dest_path.name} (this is a large file, may take a while) ...")
-    # Use curl for resumable download with progress; fall back to requests if unavailable.
-    try:
-        subprocess.run(
-            ["curl", "-fL", "-C", "-", "-o", str(dest_path), url],
-            check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        import requests
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
+    # curl: -C - resumes from a partial file on retry. --connect-timeout bounds
+    # the initial connection; --speed-limit/--speed-time aborts (and lets us
+    # retry/resume) if throughput drops below 1KB/s for 60s -- this is the
+    # "stalled CDN connection that never closes" case that otherwise hangs
+    # forever with no read-timeout.
+    tmp = dest_path.with_name(dest_path.name + ".part")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            subprocess.run(
+                ["curl", "-fL", "-C", "-", "--connect-timeout", "15",
+                 "--speed-limit", "1024", "--speed-time", "60",
+                 "-o", str(tmp), url],
+                check=True,
+            )
+            tmp.rename(dest_path)
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            if attempt == max_attempts:
+                print(f"  curl failed after {max_attempts} attempts ({e}); "
+                      f"falling back to requests-based download ...")
+                break
+            backoff = min(60, 5 * 2 ** (attempt - 1))
+            print(f"  curl attempt {attempt}/{max_attempts} failed ({e}); "
+                  f"retrying in {backoff}s (resuming) ...")
+            time.sleep(backoff)
+
+    download_with_retry(url, dest_path)
 
 
 def extract_archive(path, out_dir):

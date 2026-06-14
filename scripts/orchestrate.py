@@ -42,6 +42,10 @@ Requires:
   - (optional) VAST_SSH_PUBKEY_PATH pointing at a local SSH public key (.pub) --
     if set, the key is attached to the instance after creation so you can SSH
     in manually (e.g. `vastai ssh-url <id>`) to check progress or debug.
+  - (optional) HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) -- passed through to the
+    instance as HF_TOKEN for huggingface_hub. Not required for the current
+    public base model repo, but raises HF rate limits (helps avoid CDN stalls)
+    and covers the model becoming gated later.
 
 Usage:
   export VAST_API_KEY=...
@@ -137,7 +141,17 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
         print("the qwen3tts-finetune project to already be baked into the image, or", file=sys.stderr)
         print("you must edit build_onstart_script() to fetch it another way (e.g. R2).", file=sys.stderr)
 
-    clone_cmd = f"git clone {REPO_GIT_URL} repo" if REPO_GIT_URL else "echo 'skip clone, assuming repo present'"
+    if REPO_GIT_URL:
+        clone_cmd = (
+            f"for i in 1 2 3 4 5; do\n"
+            f"  rm -rf repo\n"
+            f"  if git clone --depth 1 {REPO_GIT_URL} repo; then break; fi\n"
+            f"  echo \"git clone attempt $i/5 failed, retrying in $((i*10))s ...\"\n"
+            f"  sleep $((i*10))\n"
+            f"done"
+        )
+    else:
+        clone_cmd = "echo 'skip clone, assuming repo present'"
 
     SLR104_PAIRS = " ".join(slr104_pairs)
     SLR104_TEST_ARG = "--include-test" if slr104_include_test else ""
@@ -147,6 +161,12 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
     script = f"""#!/bin/bash
 set -uo pipefail
 exec > /root/pipeline.log 2>&1
+
+# Unbuffered stdout/stderr -- without this, Python's block-buffering on a
+# redirected (non-tty) stream means pipeline.log can appear "stuck" on a
+# stale tqdm progress line for a long time even while a download/training
+# step is actively progressing.
+export PYTHONUNBUFFERED=1
 
 echo "=== START $(date) ==="
 
@@ -160,9 +180,23 @@ export R2_ACCESS_KEY_ID="{os.environ.get('R2_ACCESS_KEY_ID','')}"
 export R2_SECRET_ACCESS_KEY="{os.environ.get('R2_SECRET_ACCESS_KEY','')}"
 export R2_BUCKET="{os.environ.get('R2_BUCKET','')}"
 
+# --- HF_TOKEN (optional): huggingface_hub picks this up automatically for
+# snapshot_download/from_pretrained. Not required for the current public
+# Qwen3-TTS-12Hz-1.7B-Base repo, but (a) anonymous HF downloads are subject to
+# tighter rate limits / throttling -- a likely contributor to CDN stalls --
+# and (b) covers the model becoming gated later. Set HF_TOKEN locally before
+# running orchestrate.py to pass it through; harmless if empty. ---
+export HF_TOKEN="{os.environ.get('HF_TOKEN', os.environ.get('HUGGING_FACE_HUB_TOKEN', ''))}"
+
 # --- Complete handoff: install vastai CLI immediately so the cleanup trap
-# below can self-destruct the instance no matter where the pipeline fails ---
-pip install -q vastai 2>/dev/null || true
+# below can self-destruct the instance no matter where the pipeline fails.
+# Retried -- if this never installs, self-destruct can't run later, so it's
+# worth a few attempts against a flaky PyPI mirror. ---
+for i in 1 2 3 4 5; do
+  pip install -q vastai 2>/dev/null && break
+  echo "pip install vastai attempt $i/5 failed, retrying in $((i*5))s ..."
+  sleep $((i*5))
+done
 
 mark_done() {{
   echo "$1" > /root/DONE
@@ -351,7 +385,12 @@ python3 "$REPO/scripts/convert_model.py" \\
 # --- 7. attempt GGUF conversion (may fail for Qwen3-TTS -- see convert_model.py
 #        docstring; failure here does NOT abort the pipeline, since fp32/fp16
 #        checkpoints are already usable for cross-device inference) ---
-git clone --depth 1 https://github.com/ggml-org/llama.cpp ./llama.cpp 2>/dev/null || true
+for i in 1 2 3; do
+  rm -rf ./llama.cpp
+  git clone --depth 1 https://github.com/ggml-org/llama.cpp ./llama.cpp 2>/dev/null && break
+  echo "llama.cpp clone attempt $i/3 failed, retrying in $((i*10))s ..."
+  sleep $((i*10))
+done
 if [ -f ./llama.cpp/convert_hf_to_gguf.py ]; then
   python3 "$REPO/scripts/convert_model.py" \\
     --master ./checkpoints/final_fp32 \\

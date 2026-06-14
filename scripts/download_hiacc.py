@@ -14,14 +14,19 @@ import tarfile
 import requests
 from pathlib import Path
 
+from net_utils import HTTP_TIMEOUT, download_with_retry, retry
+
 ZENODO_RECORD_API = "https://zenodo.org/api/records/15551669"
 
 
 def get_file_list():
     """Query Zenodo API for the record's file list (name + download URL)."""
-    resp = requests.get(ZENODO_RECORD_API, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    def _fetch():
+        resp = requests.get(ZENODO_RECORD_API, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()
+
+    data = retry(_fetch, what="Zenodo record metadata")
     files = []
     for f in data.get("files", []):
         files.append({
@@ -32,23 +37,12 @@ def get_file_list():
     return files
 
 
-def download_file(url, dest_path, chunk_size=1 << 20):
+def download_file(url, dest_path):
     if dest_path.exists():
         print(f"  already exists, skipping: {dest_path}")
         return
     print(f"  downloading {dest_path.name} ...")
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded / total * 100
-                    print(f"\r    {pct:5.1f}%", end="", flush=True)
-        print()
+    download_with_retry(url, dest_path)
 
 
 def extract_archive(path, out_dir):

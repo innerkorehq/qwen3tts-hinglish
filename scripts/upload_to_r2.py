@@ -30,7 +30,9 @@ import sys
 from pathlib import Path
 
 import boto3
-from botocore.config import Config
+from botocore.exceptions import ClientError
+
+from net_utils import r2_boto_config, retry
 
 
 def get_client():
@@ -47,15 +49,46 @@ def get_client():
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        config=Config(signature_version="s3v4"),
+        config=r2_boto_config(),
         region_name="auto",
     )
+
+
+def ensure_bucket(client, bucket):
+    """Create the bucket if it doesn't exist yet (best-effort, idempotent).
+
+    Without this, the *first* run against a fresh R2 account would fail every
+    upload with NoSuchBucket -- including the final checkpoint upload after a
+    full training run -- which is exactly the kind of late, expensive failure
+    the onstart script's retry/self-destruct logic is meant to avoid.
+    """
+    def _head():
+        try:
+            client.head_bucket(Bucket=bucket)
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchBucket", "NotFound"):
+                return False
+            raise  # transient -- let retry() handle it
+
+    if retry(_head, what=f"head bucket {bucket}"):
+        return
+
+    try:
+        client.create_bucket(Bucket=bucket)
+        print(f"Created R2 bucket '{bucket}' (didn't exist yet)")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            print(f"WARNING: could not create bucket '{bucket}': {e}", file=sys.stderr)
 
 
 def upload_file(client, bucket, local_path, key):
     size_mb = os.path.getsize(local_path) / (1 << 20)
     print(f"Uploading {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{key}")
-    client.upload_file(str(local_path), bucket, key)
+    retry(client.upload_file, str(local_path), bucket, key,
+          what=f"upload {key}")
 
 
 def upload_dir(client, bucket, local_dir, key_prefix):
@@ -66,14 +99,15 @@ def upload_dir(client, bucket, local_dir, key_prefix):
     for f in files:
         rel = f.relative_to(local_dir)
         key = f"{key_prefix}/{rel.as_posix()}"
-        client.upload_file(str(f), bucket, key)
+        retry(client.upload_file, str(f), bucket, key, what=f"upload {key}")
         print(f"  {rel} -> {key}")
 
 
 def download_file(client, bucket, key, local_path):
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading s3://{bucket}/{key} -> {local_path}")
-    client.download_file(bucket, key, str(local_path))
+    retry(client.download_file, bucket, key, str(local_path),
+          what=f"download {key}")
 
 
 def download_dir(client, bucket, key_prefix, local_dir):
@@ -95,17 +129,24 @@ def download_dir(client, bucket, key_prefix, local_dir):
 
 
 def object_exists(client, bucket, key):
-    try:
-        client.head_object(Bucket=bucket, Key=key)
-        return True
-    except Exception:
-        return False
+    def _head():
+        try:
+            client.head_object(Bucket=bucket, Key=key)
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise  # transient (network/5xx) -- let retry() handle it
+
+    return retry(_head, what=f"head {key}")
 
 
 def prefix_exists(client, bucket, key_prefix):
     """True if any object exists under key_prefix/ (for directory uploads)."""
     prefix = key_prefix.rstrip("/") + "/"
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    resp = retry(client.list_objects_v2, Bucket=bucket, Prefix=prefix, MaxKeys=1,
+                  what=f"list {prefix}")
     return resp.get("KeyCount", 0) > 0
 
 
@@ -126,6 +167,7 @@ def main():
         sys.exit(1)
 
     client = get_client()
+    ensure_bucket(client, args.bucket)
 
     if args.exists:
         found = prefix_exists(client, args.bucket, args.key) if args.recursive \

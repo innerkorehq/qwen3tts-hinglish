@@ -126,6 +126,18 @@ creation and prints `vastai ssh-url <id>` so you can connect with
 `ssh -i ~/.ssh/id_ed25519 $(vastai ssh-url <id> | sed 's#ssh://##')` (or just
 run `vastai ssh-url <id>` again later to get the connection string).
 
+Optionally, set a Hugging Face token to pass through to the instance:
+```bash
+export HF_TOKEN=hf_...
+```
+Not required for the current public `Qwen/Qwen3-TTS-12Hz-1.7B-Base` repo, but
+recommended: anonymous HF downloads are subject to tighter rate limits, which
+can contribute to the kind of stalled-CDN-connection hang described in
+"Network robustness" below, and this also covers the model becoming gated
+later. `orchestrate.py` passes `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) through
+to the instance as `HF_TOKEN`, which `huggingface_hub` picks up automatically;
+harmless if left unset.
+
 No dataset auth tokens needed — OpenSLR-104 is a direct, ungated download
 (CC BY-SA 4.0), and HiACC is from Zenodo (also ungated).
 
@@ -273,6 +285,47 @@ below). If `FAILED_*`, fix the issue and re-run with `--resume` (see "Resuming
 a failed run") — every stage that completed before the failure (manifest,
 codes, training checkpoints) was already pushed to R2 incrementally, so
 `--resume` picks up from there rather than restarting.
+
+---
+
+## Network robustness
+
+A rented A100 instance's network can stall or drop mid-transfer at any point —
+model download, dataset download, or R2 upload/download. Without bounds, a
+stalled connection that never closes can hang **forever** (no read-timeout),
+burning cost until the 30h `--timeout-hours` backstop. Every network call in
+the pipeline now has an explicit read-timeout + retry/backoff + resume:
+
+- **`scripts/net_utils.py`** — shared helpers:
+  - `download_with_retry(url, dest)`: resumable HTTP download (Range requests
+    against a `.part` file), `HTTP_TIMEOUT=(15, 60)` read-timeout, up to 6
+    attempts with exponential backoff. Used by `download_hiacc.py` and as the
+    fallback path in `download_slr104.py`.
+  - `r2_boto_config()`: boto3 `Config` with `connect_timeout=10`,
+    `read_timeout=120`, and `retries={"max_attempts": 6, "mode": "adaptive"}`.
+    Used by `upload_to_r2.py`'s `get_client()` and `train.py`'s
+    `_r2_client_and_bucket()`.
+  - `retry(fn, ...)`: generic exponential-backoff retry, used to wrap every
+    `upload_file`/`download_file`/`head_object`/`list_objects_v2` call in
+    `upload_to_r2.py` and the Zenodo metadata fetch in `download_hiacc.py`.
+- **`bootstrap_vastai.sh` (base model download)**: `HF_HUB_DOWNLOAD_TIMEOUT=120`
+  bounds `snapshot_download`'s per-chunk read; a 5-attempt retry loop (each
+  capped at 15min via `timeout -k 10 900`) clears stale `*.lock` files and
+  resumes from `*.incomplete` files. `pip install` (deps) also retries 5x with
+  backoff.
+- **`download_slr104.py`**: `curl -C -` (resume) with `--connect-timeout 15
+  --speed-limit 1024 --speed-time 60` (abort+retry if throughput drops below
+  1KB/s for 60s — the exact "stalled but not closed" case), 6 attempts, then
+  falls back to `download_with_retry`.
+- **Onstart script (`orchestrate.py`)**: the repo `git clone` and the
+  `llama.cpp` clone (step 7, GGUF) each retry up to 5x/3x with backoff
+  (`rm -rf` + re-clone, since `git clone` fails into a non-empty dir). The
+  `pip install vastai` step (needed for self-destruct, see above) retries 5x —
+  if this silently failed permanently, the cleanup trap's self-destruct
+  wouldn't have a `vastai` binary to call.
+
+Net effect: a single dropped connection or a multi-minute CDN stall costs a
+few minutes of retries, not the whole run.
 
 ---
 
