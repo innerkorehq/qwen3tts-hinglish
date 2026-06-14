@@ -25,6 +25,7 @@ download HiACC + OpenSLR-104 (Hindi-English, Bengali-English)
   -> free disk: remove raw sliced audio now that resampled/ exists
   -> encode audio -> discrete codes (Qwen3-TTS-Tokenizer-12Hz, on GPU)
   -> backup encoded codes to R2
+  -> download base model (Qwen3-TTS-12Hz-1.7B-Base)
   -> full fine-tune (1.7B, single combined manifest)
   -> save fp32 master + bf16 + fp16 checkpoints
   -> attempt GGUF conversion (best-effort, non-fatal)
@@ -58,21 +59,27 @@ Steady-state and peak-transient usage, assuming the full ~141hr dataset
 | Component | Size |
 |---|---|
 | OS / pip / torch / CUDA baseline | ~15 GB |
-| Base model download (Qwen3-TTS-12Hz-1.7B-Base) | ~6.8 GB |
 | Raw dataset tarballs (during download, deleted after extract) | ~11.8 GB |
 | Resampled audio (24kHz mono PCM16, ~141hrs) | ~24.4 GB |
 | Encoded codes (jsonl) | ~2 GB |
+| Base model download (Qwen3-TTS-12Hz-1.7B-Base) | ~6.8 GB |
 | Checkpoints (3 recent + 1 best, ~17GB each) | ~68 GB |
 | Final saves (fp32 + bf16 + fp16) | ~13.6 GB |
 | llama.cpp clone (GGUF attempt) | ~2 GB |
 | **Steady-state total** | **~144 GB** |
 | Raw sliced audio (16kHz, before resample) — transient | +~16.3 GB |
-| **Peak transient total** (during build_manifest, before cleanup) | **~160 GB** |
+| **Peak transient total** (during build_manifest, before cleanup) | **~153.2 GB** |
 
-Against 250GB, that's **~90GB headroom at peak**. The onstart script removes
+Against 250GB, that's **~97GB headroom at peak**. The onstart script removes
 raw sliced audio (`./data/raw/slr104/*/audio`, `./data/raw/hiacc`) immediately
-after `resampled/` is built and backed up to R2, bringing usage back down to
-~144GB for the encode/train phases.
+after `resampled/` is built and backed up to R2, bringing usage back down
+before the base model is downloaded.
+
+The base model download happens *after* the build_manifest/encode stages
+(just before `train.py`, via `scripts/download_base_model.sh`) rather than
+during bootstrap — this keeps its ~6.8GB off disk during the highest-disk-usage
+window (raw + resampled audio coexisting), at the cost of a few extra minutes
+of download time right before training starts.
 
 If `FAILED_BUILD_MANIFEST`, `FAILED_ENCODE_*`, or `FAILED_TRAIN` shows a disk
 space error in `pipeline_failed.log`, increase `--disk` (e.g. to 300) — remember
@@ -199,7 +206,7 @@ Flags:
 ### `/root/DONE` status codes
 
 - `SUCCESS` — all checkpoint variants + logs uploaded to R2 (see Output formats below)
-- `FAILED_BOOTSTRAP` — dependency install or base model download failed
+- `FAILED_BOOTSTRAP` — dependency install (GPU/disk checks, Python deps) failed
 - `FAILED_DOWNLOAD_HIACC` — HiACC zenodo download/extract failed
 - `FAILED_DOWNLOAD_SLR104` — OpenSLR-104 download/extract/parse failed (e.g. mirror
   unreachable, or Kaldi data dir structure inside the tarball didn't match
@@ -207,6 +214,7 @@ Flags:
 - `FAILED_BUILD_MANIFEST` — manifest building/resampling failed, or produced no
   eval split
 - `FAILED_ENCODE_TRAIN` / `FAILED_ENCODE_EVAL` — audio-to-codes tokenization failed
+- `FAILED_DOWNLOAD_MODEL` — base model (`Qwen3-TTS-12Hz-1.7B-Base`) download failed
 - `FAILED_TRAIN` — training itself failed
 - `FAILED_CONVERT_FP16` — fp32-to-fp16 conversion failed (training succeeded,
   fp32/bf16 checkpoints likely still present — check pipeline_failed.log)
@@ -331,11 +339,11 @@ the pipeline now has an explicit read-timeout + retry/backoff + resume:
   - `retry(fn, ...)`: generic exponential-backoff retry, used to wrap every
     `upload_file`/`download_file`/`head_object`/`list_objects_v2` call in
     `upload_to_r2.py` and the Zenodo metadata fetch in `download_hiacc.py`.
-- **`bootstrap_vastai.sh` (base model download)**: `HF_HUB_DOWNLOAD_TIMEOUT=120`
-  bounds `snapshot_download`'s per-chunk read; a 5-attempt retry loop (each
-  capped at 15min via `timeout -k 10 900`) clears stale `*.lock` files and
-  resumes from `*.incomplete` files. `pip install` (deps) also retries 5x with
-  backoff.
+- **`download_base_model.sh`**: `HF_HUB_DOWNLOAD_TIMEOUT=120` bounds
+  `snapshot_download`'s per-chunk read; a 5-attempt retry loop (each capped at
+  15min via `timeout -k 10 900`) clears stale `*.lock` files and resumes from
+  `*.incomplete` files. `pip install` (deps, in `bootstrap_vastai.sh`) also
+  retries 5x with backoff.
 - **`download_slr104.py`**: `curl -C -` (resume) with `--connect-timeout 15
   --speed-limit 1024 --speed-time 60` (abort+retry if throughput drops below
   1KB/s for 60s — the exact "stalled but not closed" case), 6 attempts, then
@@ -579,9 +587,23 @@ after each epoch, `--max-steps` for dry-run timing.
 failed run) makes each pipeline stage check R2 for a prior run's output before
 recomputing it:
 
-- **Download + manifest**: if `manifest_raw.jsonl`, `manifest_eval_raw.jsonl`,
-  and `resampled/` all exist in R2, downloads them instead of re-downloading
-  HiACC/OpenSLR-104 and re-resampling.
+- **Download + manifest**: downloads `manifest_raw.jsonl`/`manifest_eval_raw.jsonl`
+  from R2 (if present) and compares their combined record count against the
+  number of objects under `resampled/` in R2:
+  - If `resampled/` has **at least as many objects as the manifests reference**,
+    it's treated as complete — downloads it and skips HiACC/OpenSLR-104
+    entirely (the large, slow downloads).
+  - If `resampled/` is **incomplete** (e.g. an earlier run was interrupted
+    mid-upload), downloads that partial set anyway, then re-downloads
+    HiACC/OpenSLR-104 and reruns `build_manifest.py`. `build_manifest.py` is
+    itself per-file resumable: for each expected output file, if it already
+    exists (non-empty) under `--resampled-dir`, it reuses it (reading the
+    duration from the file header) instead of re-decoding/re-resampling —
+    only the missing files are actually resampled.
+  - A plain `--exists --recursive` check (`MaxKeys=1`) can't tell a partial
+    upload from a complete one, which is why this uses
+    `upload_to_r2.py --count --recursive` (counts all objects under a prefix)
+    instead.
 - **Encode**: if `train_with_codes.jsonl` and `eval_with_codes.jsonl` exist in
   R2, downloads them instead of re-running `encode_codes.py`.
 - **Train**: if `accel_state/` and `training_state.json` exist in R2, downloads

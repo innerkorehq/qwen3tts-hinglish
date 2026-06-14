@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Bootstrap script for Vast.ai A100 instance.
 # Called automatically by orchestrate.py's onstart script (no manual SSH needed).
-# Handles environment setup only: GPU/disk checks, Python deps, base model
-# download. Dataset download, manifest building, encoding, and training are
+# Handles environment setup only: GPU/disk checks, Python deps. The base model
+# download, dataset download, manifest building, encoding, and training are
 # separate steps in orchestrate.py's onstart pipeline — see docs/RUNBOOK.md.
 #
 # Usage (called from onstart script with cwd=/root/work, on the instance's
@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-echo "=== 1/4: Checking GPU ==="
+echo "=== 1/3: Checking GPU ==="
 nvidia-smi || { echo "ERROR: no GPU visible"; exit 1; }
 
-echo "=== 2/4: Checking container disk space ==="
+echo "=== 2/3: Checking container disk space ==="
 df -h .
 FREE_GB=$(df --output=avail -BG . | tail -1 | tr -dc '0-9')
 echo "Free space: ${FREE_GB}GB"
@@ -25,7 +25,7 @@ if [ "$FREE_GB" -lt 100 ]; then
   echo "docs/RUNBOOK.md 'Disk budget')."
 fi
 
-echo "=== 3/4: Installing Python deps ==="
+echo "=== 3/3: Installing Python deps ==="
 # Retry pip installs -- PyPI/index hiccups are common and otherwise abort the
 # whole run via `set -e` before training even starts.
 pip_retry() {
@@ -40,35 +40,32 @@ pip_retry -U pip
 pip_retry qwen-tts transformers accelerate deepspeed boto3 soundfile librosa \
   datasets huggingface_hub pydub requests pyyaml
 
-echo "=== 4/4: Downloading base model ==="
-mkdir -p ./data ./models
+echo "=== 3a/3: Installing sox ==="
+# librosa/audioread fall back to sox (via subprocess) when soundfile can't
+# read a file -- without it that fallback path errors with "SoX could not be
+# found". Best-effort: not fatal if apt is unavailable/offline.
+if command -v sox >/dev/null 2>&1; then
+  echo "sox already present"
+else
+  (apt-get update -qq && apt-get install -y -qq sox libsox-fmt-all) > /dev/null 2>&1 \
+    && echo "sox installed" \
+    || echo "WARNING: sox install failed -- continuing (only used as a librosa/audioread fallback backend)"
+fi
 
-# huggingface_hub's streaming download has no read-timeout by default, so a
-# CDN connection that silently stalls (stops sending bytes without closing)
-# can hang forever -- HF_HUB_DOWNLOAD_TIMEOUT bounds that, and the retry loop
-# below resumes from the partial *.incomplete files (range requests) on the
-# next attempt. Stale *.lock files from a killed attempt are cleared first.
-export HF_HUB_DOWNLOAD_TIMEOUT=120
-MODEL_DIR=./models/Qwen3-TTS-12Hz-1.7B-Base
-for attempt in 1 2 3 4 5; do
-  echo "--- snapshot_download attempt $attempt/5 ---"
-  find "$MODEL_DIR" -name "*.lock" -delete 2>/dev/null || true
-  if timeout -k 10 900 python3 - <<EOF
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    local_dir="$MODEL_DIR",
-)
-EOF
-  then
-    break
-  fi
-  if [ "$attempt" = "5" ]; then
-    echo "ERROR: snapshot_download failed after 5 attempts"
-    exit 1
-  fi
-  echo "attempt $attempt timed out or failed -- retrying (resumes from partial files) ..."
-done
+echo "=== 3b/3: Installing flash-attn (optional, faster attention) ==="
+# Builds a CUDA extension from source -- can take 10-20+ minutes and needs
+# nvcc; MAX_JOBS bounds parallel compile jobs to avoid OOM on many-core boxes.
+# Best-effort and non-fatal: without it, qwen_tts just falls back to the
+# manual PyTorch attention path (slower, but already works).
+pip_retry ninja packaging
+export MAX_JOBS=4
+if timeout 1800 pip install -q flash-attn --no-build-isolation; then
+  echo "flash-attn installed"
+else
+  echo "WARNING: flash-attn install failed or timed out -- continuing without it (slower attention, non-fatal)"
+fi
+
+mkdir -p ./data ./models
 
 echo ""
 echo "=== Bootstrap complete ==="

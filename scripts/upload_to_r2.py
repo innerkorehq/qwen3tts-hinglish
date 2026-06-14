@@ -193,6 +193,21 @@ def prefix_exists(client, bucket, key_prefix):
     return resp.get("KeyCount", 0) > 0
 
 
+def count_prefix(client, bucket, key_prefix):
+    """Count objects under key_prefix/ (excluding the directory-marker object
+    itself, if any) -- used for resume completeness checks where a single
+    `prefix_exists` (MaxKeys=1) would wrongly treat a partially-uploaded
+    directory as complete."""
+    prefix = key_prefix.rstrip("/") + "/"
+    paginator = client.get_paginator("list_objects_v2")
+    count = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"] != prefix:
+                count += 1
+    return count
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", required=False, help="local path (upload source / download dest)")
@@ -203,6 +218,11 @@ def main():
     ap.add_argument("--exists", action="store_true",
                     help="check whether --key (or --key prefix if --recursive) exists; "
                          "prints EXISTS/MISSING and exits 0/1, no --file needed")
+    ap.add_argument("--count", action="store_true",
+                    help="print the number of objects under --key prefix (requires "
+                         "--recursive) -- for resume completeness checks, where "
+                         "--exists (MaxKeys=1) can't tell a partial upload from a "
+                         "complete one; no --file needed")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"parallel transfers for --recursive (default {DEFAULT_CONCURRENCY})")
     args = ap.parse_args()
@@ -213,6 +233,10 @@ def main():
 
     client = get_client()
     ensure_bucket(client, args.bucket)
+
+    if args.count:
+        print(count_prefix(client, args.bucket, args.key))
+        return
 
     if args.exists:
         found = prefix_exists(client, args.bucket, args.key) if args.recursive \

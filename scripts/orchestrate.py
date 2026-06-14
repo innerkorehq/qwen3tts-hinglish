@@ -10,8 +10,9 @@ Flow (everything in one rental, see docs/RUNBOOK.md):
   3. Onstart script runs the whole pipeline on /root/work:
      bootstrap -> download HiACC + OpenSLR-104 (Hindi-English, Bengali-English)
      -> build manifest (resample, split) -> backup to R2 -> encode_codes.py
-     -> backup codes to R2 -> train.py -> convert formats -> upload all
-     checkpoint variants + logs to R2 -> write DONE marker
+     -> backup codes to R2 -> download base model -> train.py -> convert
+     formats -> upload all checkpoint variants + logs to R2 -> write DONE
+     marker
   4. Poll instance status + DONE marker
   5. On completion (or failure/timeout), destroy the instance -- container disk
      is destroyed with it, no separate cleanup step
@@ -253,33 +254,48 @@ if [ ! -d "$REPO" ]; then
   mark_done FAILED_BOOTSTRAP; exit 1
 fi
 
-# --- 1. bootstrap deps + base model (downloads base model into /root/work/models) ---
+# --- 1. bootstrap deps (GPU/disk checks, Python deps, sox, flash-attn) ---
 bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 1; }}
 
 # --- 2/3. download datasets + build unified manifest (resample to 24kHz mono,
 #          filter, train/eval split) -- or, with --resume, reuse a prior run's
 #          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled from R2 ---
+#
+# Upfront completeness check (before downloading HiACC/OpenSLR-104, which are
+# large and slow): a bare `--exists --recursive` only checks for *any* object
+# under resampled/ (MaxKeys=1), so a partially-uploaded resampled/ from an
+# interrupted earlier run would look "complete" and the whole rebuild would be
+# skipped -- leaving most resampled files missing for encode_codes.py later.
+# Instead, compare the object count under resampled/ against the record count
+# across both manifests.
 RESUME_MANIFEST=0
 if [ "{RESUME}" = "1" ]; then
-  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/manifest_raw.jsonl \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/manifest_eval_raw.jsonl \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --exists --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled; then
-    RESUME_MANIFEST=1
+  if python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+    EXPECTED=$(cat ./data/manifest_raw.jsonl ./data/manifest_eval_raw.jsonl | wc -l)
+    ACTUAL=$(python3 "$REPO/scripts/upload_to_r2.py" --count --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled)
+    echo "--resume: manifests reference $EXPECTED resampled files; R2 resampled/ has $ACTUAL"
+    if [ "$EXPECTED" -gt "0" ] && [ "$ACTUAL" -ge "$EXPECTED" ]; then
+      RESUME_MANIFEST=1
+    fi
   fi
 fi
 
 if [ "$RESUME_MANIFEST" = "1" ]; then
-  echo "--resume: found manifest + resampled audio in R2, downloading instead of rebuilding"
-  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  echo "--resume: resampled audio in R2 is complete, downloading instead of rebuilding"
   python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/resampled --file ./data/resampled \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
 else
+  if [ "{RESUME}" = "1" ] && [ -f ./data/manifest_raw.jsonl ]; then
+    echo "--resume: resampled audio in R2 is incomplete -- downloading the partial set"
+    echo "  (build_manifest.py will reuse those files and only resample what's missing)"
+    python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/resampled --file ./data/resampled || true
+  fi
+
   python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
     || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
 
@@ -356,6 +372,13 @@ else
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/eval_with_codes.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/eval_with_codes.jsonl
 fi
+
+# --- 4.5. download base model (init_model_path for train.py) -- done here,
+#          after resampling/encoding and the raw-data cleanup in step 2/3,
+#          rather than during bootstrap, so its ~6.8GB isn't sitting on disk
+#          during build_manifest's peak-transient window. See docs/RUNBOOK.md
+#          "Disk budget". ---
+bash "$REPO/scripts/download_base_model.sh" || {{ mark_done FAILED_DOWNLOAD_MODEL; exit 1; }}
 
 # --- 5. train (produces final_fp32, final_bf16, final aliased to fp32) -- or,
 #        with --resume, reuse a prior run's accel_state/training_state.json

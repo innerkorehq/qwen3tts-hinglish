@@ -49,10 +49,28 @@ def resample_inplace_or_copy(src_path: Path, dst_path: Path):
 
 
 def _resample_task(task):
-    """Top-level (picklable) wrapper for ProcessPoolExecutor workers."""
+    """Top-level (picklable) wrapper for ProcessPoolExecutor workers.
+
+    Resumable: if dst already exists (e.g. partially restored from R2 on a
+    --resume run) and is readable/non-empty, reuse it and just read its
+    duration from the header instead of re-decoding+re-resampling the source.
+    """
     i, src_str, dst_str = task
+    dst = Path(dst_str)
+    if dst.exists() and dst.stat().st_size > 0:
+        try:
+            info = sf.info(str(dst))
+            return i, info.frames / info.samplerate, None
+        except Exception:
+            pass  # existing file is unreadable/corrupt -- fall through and re-resample
+
     try:
-        dur = resample_inplace_or_copy(Path(src_str), Path(dst_str))
+        dur = resample_inplace_or_copy(Path(src_str), dst)
+        # Guard against any silent write failure (e.g. ENOSPC swallowed by a
+        # backend) -- without this, build_manifest would record a path that
+        # encode_codes.py later fails to open with ENOENT.
+        if not dst.exists() or dst.stat().st_size == 0:
+            return i, None, f"resampled file missing or empty after write: {dst}"
     except Exception as e:
         return i, None, str(e)
     return i, dur, None
@@ -189,7 +207,9 @@ def main():
     if n_missing:
         print(f"  skipping {n_missing} records with missing source audio")
 
-    print(f"  resampling {len(tasks)} files using {args.workers} worker processes ...")
+    print(f"  resampling {len(tasks)} files using {args.workers} worker processes "
+          f"(files already present in --resampled-dir, e.g. from a --resume R2 "
+          f"download, are reused as-is) ...")
 
     kept = []
     total_dur = 0.0
