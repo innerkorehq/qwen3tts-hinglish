@@ -16,6 +16,17 @@ Flow (everything in one rental, see docs/RUNBOOK.md):
   5. On completion (or failure/timeout), destroy the instance -- container disk
      is destroyed with it, no separate cleanup step
 
+COMPLETE HANDOFF: step 3's onstart script is fully self-contained and
+self-cleaning -- an EXIT/TERM/INT trap uploads pipeline.log + a status.txt to
+R2 and self-destructs the instance (`vastai destroy instance $CONTAINER_ID
+--api-key $CONTAINER_API_KEY -y`) on ANY exit path: SUCCESS, any FAILED_*, or
+an unexpected crash. This means the run completes (or fails and cleans up,
+stopping billing) entirely on its own even if this orchestrator process or the
+local machine running it is offline for the whole run. Steps 4/5 here are then
+just an optional live-progress view + an idempotent backstop destroy for cases
+the instance itself can't handle (--timeout-hours, a dead/offline instance).
+See docs/RUNBOOK.md "Self-destruct and handoff".
+
 Only final and important intermediary artifacts (raw manifests, resampled audio,
 encoded codes, checkpoint variants, logs) go to R2 -- /root/work is scratch space
 for the run and disappears with the instance.
@@ -108,6 +119,17 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
     (accel_state/training_state.json) is handled the same way and passed to
     train.py via --resume; train.py itself uploads accel_state/training_state
     (and the best checkpoint) to R2 after each epoch.
+
+    The script is a complete handoff to the instance: an EXIT/TERM/INT trap
+    (1) writes /root/DONE if some unexpected error path skipped it, (2) uploads
+    /root/pipeline.log (plus a per-failure timestamped copy on non-SUCCESS) and
+    a small status.txt to R2 so the run is debuggable even if the local
+    orchestrator is offline, and (3) self-destructs the instance via
+    `vastai destroy instance $CONTAINER_ID --api-key $CONTAINER_API_KEY -y`.
+    This means the instance cleans up and stops billing on its own -- success,
+    any FAILED_*, or an unexpected crash -- even if the M4 orchestrator is
+    asleep, disconnected, or shut down. See docs/RUNBOOK.md "Self-destruct and
+    handoff".
     """
     if not REPO_GIT_URL:
         print("WARNING: REPO_GIT_URL is not set. The onstart script will expect", file=sys.stderr)
@@ -129,6 +151,7 @@ echo "=== START $(date) ==="
 
 cd /root
 {clone_cmd}
+REPO=/root/repo
 
 # --- env for R2 ---
 export R2_ACCOUNT_ID="{os.environ.get('R2_ACCOUNT_ID','')}"
@@ -136,15 +159,52 @@ export R2_ACCESS_KEY_ID="{os.environ.get('R2_ACCESS_KEY_ID','')}"
 export R2_SECRET_ACCESS_KEY="{os.environ.get('R2_SECRET_ACCESS_KEY','')}"
 export R2_BUCKET="{os.environ.get('R2_BUCKET','')}"
 
+# --- Complete handoff: install vastai CLI immediately so the cleanup trap
+# below can self-destruct the instance no matter where the pipeline fails ---
+pip install -q vastai 2>/dev/null || true
+
 mark_done() {{
   echo "$1" > /root/DONE
   echo "=== END $(date) status=$1 ==="
 }}
 
+# --- Cleanup trap: runs on ANY exit (success, FAILED_*, or an unexpected
+# crash/signal). Uploads logs + a status file to R2 (so the run is debuggable
+# even with the instance gone) and self-destructs the instance via the
+# instance-scoped CONTAINER_ID/CONTAINER_API_KEY -- this is what makes the
+# instance independent of the M4 orchestrator: it stops billing on its own
+# even if the orchestrator is offline. See docs/RUNBOOK.md "Self-destruct and
+# handoff".
+CLEANED_UP=0
+cleanup() {{
+  if [ "$CLEANED_UP" = "1" ]; then return; fi
+  CLEANED_UP=1
+
+  if [ ! -f /root/DONE ]; then
+    echo "UNKNOWN_EXIT" > /root/DONE
+    echo "=== END $(date) status=UNKNOWN_EXIT (unexpected crash/signal) ==="
+  fi
+  STATUS=$(cat /root/DONE)
+
+  python3 "$REPO/scripts/upload_to_r2.py" --file /root/pipeline.log --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/logs/pipeline.log 2>/dev/null || true
+  python3 "$REPO/scripts/upload_to_r2.py" --file /root/DONE --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/logs/status.txt 2>/dev/null || true
+  if [ "$STATUS" != "SUCCESS" ]; then
+    python3 "$REPO/scripts/upload_to_r2.py" --file /root/pipeline.log --bucket "$R2_BUCKET" \\
+      --key "{R2_PREFIX}/logs/pipeline_failed_${{STATUS}}_$(date +%s).log" 2>/dev/null || true
+  fi
+
+  echo "Self-destructing instance $CONTAINER_ID (status=$STATUS) ..."
+  vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" -y || true
+}}
+trap cleanup EXIT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 130' INT
+
 # --- All working data lives under /root/work on the instance's container disk ---
 # (final and important intermediary artifacts are also pushed to R2 below;
 # /root/work disappears with the instance at the end of the run)
-REPO=/root/repo
 mkdir -p /root/work
 cd /root/work
 mkdir -p data models checkpoints
@@ -303,26 +363,34 @@ else
 fi
 
 # --- 8. upload all checkpoint variants + logs (final artifacts -> R2) ---
-python3 "$REPO/scripts/upload_to_r2.py" --file ./checkpoints/final_fp32 --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/final_fp32 --recursive \\
+# Trained checkpoints exist only on this instance's container disk, and the
+# cleanup trap self-destructs the instance regardless of upload outcome -- so
+# retry each checkpoint upload a few times before giving up, to minimize the
+# chance of losing a completed training run to a transient R2 hiccup.
+upload_with_retry() {{
+  for attempt in 1 2 3; do
+    if python3 "$REPO/scripts/upload_to_r2.py" --file "$1" --bucket "$R2_BUCKET" --key "$2" --recursive; then
+      return 0
+    fi
+    echo "upload attempt $attempt for $2 failed, retrying in 30s ..."
+    sleep 30
+  done
+  return 1
+}}
+
+upload_with_retry ./checkpoints/final_fp32 {R2_PREFIX}/final_fp32 \\
   || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
 
-python3 "$REPO/scripts/upload_to_r2.py" --file ./checkpoints/final_bf16 --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/final_bf16 --recursive \\
+upload_with_retry ./checkpoints/final_bf16 {R2_PREFIX}/final_bf16 \\
   || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
 
-python3 "$REPO/scripts/upload_to_r2.py" --file ./checkpoints/final_fp16 --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/final_fp16 --recursive \\
+upload_with_retry ./checkpoints/final_fp16 {R2_PREFIX}/final_fp16 \\
   || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
 
 # Upload GGUF only if it was produced (best-effort, doesn't fail the run)
 if [ -d ./checkpoints/final_gguf ]; then
-  python3 "$REPO/scripts/upload_to_r2.py" --file ./checkpoints/final_gguf --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/final_gguf --recursive || true
+  upload_with_retry ./checkpoints/final_gguf {R2_PREFIX}/final_gguf || true
 fi
-
-python3 "$REPO/scripts/upload_to_r2.py" --file /root/pipeline.log --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/logs/pipeline.log
 
 mark_done SUCCESS
 """
@@ -352,6 +420,29 @@ def get_instance_status(instance_id):
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
+
+
+def download_r2_status():
+    """Best-effort: download the status.txt the instance's cleanup trap uploads
+    to R2 just before self-destructing (see build_onstart_script). Returns the
+    status string, or None if not present -- e.g. the instance is still
+    running, hasn't reached the cleanup trap yet, or vastai/pip install failed
+    on the instance before it could upload anything."""
+    tmp = Path("/tmp/r2_status_check.txt")
+    if tmp.exists():
+        tmp.unlink()
+    run([
+        "python3", str(Path(__file__).resolve().parent / "upload_to_r2.py"),
+        "--download",
+        "--bucket", os.environ["R2_BUCKET"],
+        "--key", f"{R2_PREFIX}/logs/status.txt",
+        "--file", str(tmp),
+    ], check=False, quiet=True)
+    if tmp.exists():
+        content = tmp.read_text().strip()
+        tmp.unlink()
+        return content
+    return None
 
 
 def check_done_marker(instance_id):
@@ -452,6 +543,7 @@ def main():
     print("\\nCreating instance ...")
     instance_id = None
     final_status = None
+    self_destructed = False
 
     try:
         instance_id = create_instance(best["id"], args.disk, onstart_path)
@@ -471,6 +563,8 @@ def main():
         start = time.time()
         timeout_sec = args.timeout_hours * 3600
 
+        self_destructed = False
+
         while True:
             elapsed = time.time() - start
             if elapsed > timeout_sec:
@@ -482,6 +576,18 @@ def main():
             actual_status = info.get("actual_status") if info else None
             print(f"  [{elapsed/60:.1f}min] instance status: {actual_status}")
 
+            if not info:
+                # The instance may already be gone -- its cleanup trap
+                # self-destructs it on completion/failure regardless of
+                # whether we're polling (see build_onstart_script). Check R2
+                # for the status it uploads just before destroying itself.
+                r2_status = download_r2_status()
+                if r2_status:
+                    print(f"\\nInstance is gone; self-reported status from R2: {r2_status}")
+                    final_status = r2_status
+                    self_destructed = True
+                    break
+
             if actual_status in ("exited", "offline"):
                 print(f"\\nInstance reached terminal bad state: {actual_status}")
                 final_status = f"INSTANCE_{actual_status.upper()}"
@@ -491,6 +597,10 @@ def main():
             if marker:
                 print(f"\\nDONE marker found: {marker}")
                 final_status = marker
+                # The instance's own cleanup trap is uploading logs/status and
+                # self-destructing right about now -- the destroy_instance()
+                # call below is a harmless, idempotent backstop.
+                self_destructed = True
                 break
 
             time.sleep(args.poll_interval)
@@ -508,17 +618,32 @@ def main():
     if final_status == "SUCCESS":
         print(f"Results uploaded to R2 under {R2_PREFIX}/ "
               f"(final_fp32/, final_bf16/, final_fp16/, manifest/codes backups, logs/)")
-    elif final_status and final_status.startswith("FAILED") and instance_id is not None:
-        print("Pipeline failed mid-run. Pulling log before destroying instance ...")
-        run(["vastai", "copy", f"{instance_id}:/root/pipeline.log", "local:./pipeline_failed.log"], check=False)
-        print("Saved to ./pipeline_failed.log -- inspect before retrying.")
+    elif final_status not in (None, "SUCCESS"):
+        print("Pipeline did not succeed. Pulling log for debugging ...")
+        if self_destructed or instance_id is None:
+            run([
+                "python3", str(Path(__file__).resolve().parent / "upload_to_r2.py"),
+                "--download", "--bucket", os.environ["R2_BUCKET"],
+                "--key", f"{R2_PREFIX}/logs/pipeline.log", "--file", "./pipeline_failed.log",
+            ], check=False)
+        else:
+            run(["vastai", "copy", f"{instance_id}:/root/pipeline.log", "local:./pipeline_failed.log"], check=False)
+        print("Saved to ./pipeline_failed.log (if found) -- inspect before retrying.")
+        print(f"Full status + per-failure log copies are also under "
+              f"{R2_PREFIX}/logs/ in R2 (status.txt, pipeline_failed_<status>_<ts>.log).")
 
     if instance_id is not None:
-        print(f"\\nDestroying instance {instance_id} ...")
+        # Idempotent backstop: the instance's own cleanup trap already
+        # self-destructs on every exit path (success, FAILED_*, timeout-from-
+        # the-instance's-perspective, or an unexpected crash/signal) -- see
+        # build_onstart_script's "Self-destruct and handoff". This call covers
+        # the remaining cases where the orchestrator itself decides to give up
+        # (--timeout-hours, INSTANCE_EXITED/OFFLINE, Ctrl-C, provisioning error).
+        print(f"\\nDestroying instance {instance_id} (if not already self-destructed) ...")
         destroy_instance(instance_id)
         print("Done. Billing stopped, container disk destroyed with the instance.")
     else:
-        print("Done. (No instance was created.)")
+        print("Done. (No instance was created, or it already self-destructed.)")
 
 
 if __name__ == "__main__":

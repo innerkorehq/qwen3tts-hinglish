@@ -172,12 +172,17 @@ Flags:
    and `reliability > 0.95`
 2. `create_instance()` launches it with `--disk 250` and an onstart script
    containing the full pipeline
-3. The instance immediately starts running in the background (no SSH needed)
-4. The orchestrator polls instance status + `/root/DONE` via `vastai copy` every
-   `--poll-interval` seconds
+3. The instance immediately starts running in the background (no SSH needed) —
+   and is **fully self-sufficient from here**: see "Self-destruct and handoff"
+   below. It will finish (or fail) and shut itself down without any further
+   help from the orchestrator or your local machine.
+4. The orchestrator (if still running) polls instance status + `/root/DONE`
+   via `vastai copy` every `--poll-interval` seconds, purely to show progress
+   and to fetch the final status/log
 5. On `SUCCESS`, `FAILED_*`, `TIMEOUT`, or a bad instance state (`exited`/`offline`),
-   the instance is **destroyed automatically** — billing stops, and the
-   container disk is destroyed with it (no separate cleanup step)
+   the instance is **destroyed** (by itself, or as an idempotent backstop by
+   the orchestrator) — billing stops, and the container disk is destroyed with
+   it (no separate cleanup step)
 
 ### `/root/DONE` status codes
 
@@ -193,20 +198,81 @@ Flags:
 - `FAILED_TRAIN` — training itself failed
 - `FAILED_CONVERT_FP16` — fp32-to-fp16 conversion failed (training succeeded,
   fp32/bf16 checkpoints likely still present — check pipeline_failed.log)
-- `FAILED_UPLOAD_MODEL` — upload to R2 failed after training succeeded (worst case
-  to hit late — checkpoints may exist only on the now-destroyed instance)
+- `FAILED_UPLOAD_MODEL` — checkpoint upload to R2 failed (after 3 retries with
+  30s backoff) despite training succeeding — see "Self-destruct and handoff"
+  for why this is no longer the unrecoverable worst case it used to be
+- `UNKNOWN_EXIT` — the script exited via an unexpected crash or signal that
+  skipped `mark_done` entirely (the cleanup trap writes this as a fallback so
+  the instance still self-destructs and uploads logs)
 - `ERROR_PROVISIONING` — failed before the pipeline even started, e.g.
   `create_instance()` itself failed (offer no longer available, account
   issue, etc.). No instance to destroy in this case.
 - `INSTANCE_EXITED` / `INSTANCE_OFFLINE` — the instance itself reached a bad
   state (container crashed or host disconnected) before writing `/root/DONE`
 
-On any `FAILED_*`, the orchestrator pulls `/root/pipeline.log` to
-`./pipeline_failed.log` locally before destroying the instance, so you can debug
-without re-renting.
+On any non-`SUCCESS` status, the orchestrator pulls `/root/pipeline.log` (via
+`vastai copy`, or from R2 if the instance already self-destructed) to
+`./pipeline_failed.log` locally, so you can debug without re-renting. The same
+log, plus `status.txt` and a timestamped `pipeline_failed_<status>_<ts>.log`,
+are always in R2 under `finetune/qwen3tts-hinglish/logs/` regardless of
+whether the orchestrator was even running — see "Self-destruct and handoff".
 
 **GGUF conversion failure does NOT set a FAILED status** — it's expected to likely
 fail for Qwen3-TTS (see Output formats below) and the pipeline continues regardless.
+
+---
+
+## Self-destruct and handoff
+
+Once `vastai create instance` returns, **the instance is on its own** — the
+onstart script is a complete handoff. You can close your laptop, lose your
+internet connection, or `Ctrl-C` the orchestrator, and the run still completes
+(or fails) and stops billing without further input.
+
+This is implemented with a bash `trap` near the top of the onstart script that
+runs `cleanup()` on **every** exit path — normal completion, any
+`mark_done FAILED_*; exit 1`, or an unexpected crash/signal (`EXIT`/`TERM`/`INT`).
+`cleanup()`:
+
+1. If `/root/DONE` was never written (an unexpected crash), writes `UNKNOWN_EXIT`
+   so the run still has a final status.
+2. Uploads `/root/pipeline.log` to R2 at `finetune/qwen3tts-hinglish/logs/pipeline.log`
+   (always overwritten — latest run) and the contents of `/root/DONE` to
+   `finetune/qwen3tts-hinglish/logs/status.txt`.
+3. On any non-`SUCCESS` status, additionally uploads a timestamped copy to
+   `finetune/qwen3tts-hinglish/logs/pipeline_failed_<status>_<ts>.log` — so
+   repeated failed attempts don't clobber each other's logs ("create an R2
+   artifact for the error").
+4. Self-destructs the instance:
+   `vastai destroy instance $CONTAINER_ID --api-key $CONTAINER_API_KEY -y`.
+   `CONTAINER_ID` and `CONTAINER_API_KEY` are injected automatically by Vast.ai
+   into every instance — no extra credentials need to be passed in. `vastai`
+   itself is `pip install`ed as the very first step of the onstart script (before
+   the repo clone or bootstrap), so this works even if `FAILED_BOOTSTRAP` fires.
+
+All of this is **idempotent and best-effort** (`|| true` everywhere except the
+final destroy): if R2 is unreachable, the instance still self-destructs (cost
+control wins); if `vastai` itself somehow isn't usable, the orchestrator's own
+`destroy_instance()` call (run unconditionally at the end of `main()`, `-y`,
+`check=False`) is a harmless backstop — destroying an already-destroyed
+instance just fails quietly.
+
+**Checkpoint uploads get retries, not silent loss**: `FAILED_UPLOAD_MODEL`
+(step 8) retries each of `final_fp32`/`final_bf16`/`final_fp16` up to 3 times
+with 30s backoff before giving up — a completed training run is the most
+expensive thing to lose, so it gets a few chances against a transient R2 hiccup
+before the instance (correctly) self-destructs anyway.
+
+**If the orchestrator is offline when the run finishes**: when you next run
+`orchestrate.py` (or just check manually), `get_instance_status()` will find
+the instance gone. The orchestrator then downloads
+`finetune/qwen3tts-hinglish/logs/status.txt` from R2 to learn the final status,
+and pulls `pipeline.log` from R2 instead of `vastai copy`. If `SUCCESS`,
+download the checkpoint variants as usual (see "Verify and download results"
+below). If `FAILED_*`, fix the issue and re-run with `--resume` (see "Resuming
+a failed run") — every stage that completed before the failure (manifest,
+codes, training checkpoints) was already pushed to R2 incrementally, so
+`--resume` picks up from there rather than restarting.
 
 ---
 
