@@ -15,8 +15,21 @@ import argparse
 import json
 import os
 import random
+
+# Cap BLAS/OMP threads per process to 1 *before* importing numpy/librosa --
+# otherwise each resampling worker spawns its own thread pool and a handful of
+# processes can saturate all CPUs while ProcessPoolExecutor (added below)
+# still only "shows" a few processes. With this set, parallelism comes purely
+# from the process pool, so --workers actually scales across all cores.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import soundfile as sf
 import librosa
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 TARGET_SR = 24000
@@ -33,6 +46,16 @@ def resample_inplace_or_copy(src_path: Path, dst_path: Path):
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(dst_path), y, TARGET_SR, subtype="PCM_16")
     return dur
+
+
+def _resample_task(task):
+    """Top-level (picklable) wrapper for ProcessPoolExecutor workers."""
+    i, src_str, dst_str = task
+    try:
+        dur = resample_inplace_or_copy(Path(src_str), Path(dst_str))
+    except Exception as e:
+        return i, None, str(e)
+    return i, dur, None
 
 
 # HiACC (Zenodo record 15551669, Corpus.zip) layout, verified by inspection:
@@ -129,6 +152,8 @@ def main():
                     help="where to write 24kHz mono copies")
     ap.add_argument("--eval-frac", type=float, default=0.02)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 4,
+                    help="parallel resampling workers (default: all CPUs)")
     args = ap.parse_args()
 
     hiacc_dir = Path(args.hiacc_dir)
@@ -152,31 +177,47 @@ def main():
         raise SystemExit("No pairs found at all — check input directories before continuing.")
 
     print("Resampling to 24kHz mono and filtering by duration ...")
-    kept = []
-    total_dur = 0.0
+    tasks = []
+    n_missing = 0
     for i, rec in enumerate(all_pairs):
         src = Path(rec["audio"])
         if not src.exists():
+            n_missing += 1
             continue
         dst = resampled_dir / rec["source"] / f"{i:08d}.wav"
-        try:
-            dur = resample_inplace_or_copy(src, dst)
-        except Exception as e:
-            print(f"  skipping {src} (error: {e})")
-            continue
-        if dur < MIN_DUR or dur > MAX_DUR:
-            continue
-        rec_out = dict(rec)
-        rec_out["audio"] = str(dst.resolve())
-        # Self-reference: each clip is its own speaker reference for the
-        # Qwen3-TTS speaker encoder (multi-speaker full-FT, no grouping by
-        # speaker needed).
-        rec_out["ref_audio"] = rec_out["audio"]
-        rec_out["duration"] = dur
-        kept.append(rec_out)
-        total_dur += dur
-        if i % 1000 == 0:
-            print(f"  ... {i}/{len(all_pairs)}, kept {len(kept)}, {total_dur/3600:.2f}hrs")
+        tasks.append((i, str(src), str(dst)))
+    if n_missing:
+        print(f"  skipping {n_missing} records with missing source audio")
+
+    print(f"  resampling {len(tasks)} files using {args.workers} worker processes ...")
+
+    kept = []
+    total_dur = 0.0
+    n_done = 0
+    n_errors = 0
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        for i, dur, err in ex.map(_resample_task, tasks, chunksize=32):
+            n_done += 1
+            if err is not None:
+                n_errors += 1
+                if n_errors <= 20:
+                    print(f"  skipping {all_pairs[i]['audio']} (error: {err})")
+                continue
+            if dur < MIN_DUR or dur > MAX_DUR:
+                continue
+            rec = all_pairs[i]
+            dst = resampled_dir / rec["source"] / f"{i:08d}.wav"
+            rec_out = dict(rec)
+            rec_out["audio"] = str(dst.resolve())
+            # Self-reference: each clip is its own speaker reference for the
+            # Qwen3-TTS speaker encoder (multi-speaker full-FT, no grouping by
+            # speaker needed).
+            rec_out["ref_audio"] = rec_out["audio"]
+            rec_out["duration"] = dur
+            kept.append(rec_out)
+            total_dur += dur
+            if n_done % 1000 == 0:
+                print(f"  ... {n_done}/{len(tasks)}, kept {len(kept)}, {total_dur/3600:.2f}hrs")
 
     print(f"\nKept {len(kept)} clips, total {total_dur/3600:.2f} hours")
 
