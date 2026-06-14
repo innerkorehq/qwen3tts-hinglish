@@ -54,6 +54,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -422,6 +423,16 @@ def get_instance_status(instance_id):
         return None
 
 
+def _clear_tmp(path):
+    """Remove a leftover tmp path, whether it's a file, an empty dir, or a dir
+    `vastai copy`/rsync sometimes leaves behind when the remote source doesn't
+    exist yet (plain Path.unlink() raises EPERM/IsADirectoryError on a dir)."""
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    elif path.exists():
+        path.unlink()
+
+
 def download_r2_status():
     """Best-effort: download the status.txt the instance's cleanup trap uploads
     to R2 just before self-destructing (see build_onstart_script). Returns the
@@ -429,8 +440,7 @@ def download_r2_status():
     running, hasn't reached the cleanup trap yet, or vastai/pip install failed
     on the instance before it could upload anything."""
     tmp = Path("/tmp/r2_status_check.txt")
-    if tmp.exists():
-        tmp.unlink()
+    _clear_tmp(tmp)
     run([
         "python3", str(Path(__file__).resolve().parent / "upload_to_r2.py"),
         "--download",
@@ -438,10 +448,11 @@ def download_r2_status():
         "--key", f"{R2_PREFIX}/logs/status.txt",
         "--file", str(tmp),
     ], check=False, quiet=True)
-    if tmp.exists():
+    if tmp.is_file():
         content = tmp.read_text().strip()
-        tmp.unlink()
+        _clear_tmp(tmp)
         return content
+    _clear_tmp(tmp)
     return None
 
 
@@ -455,17 +466,17 @@ def check_done_marker(instance_id):
     never being created.
     """
     tmp = Path("/tmp/DONE_marker_check")
-    if tmp.exists():
-        tmp.unlink()
+    _clear_tmp(tmp)
     run([
         "vastai", "copy",
         f"{instance_id}:/root/DONE",
         f"local:{tmp}",
     ], check=False, quiet=True)
-    if tmp.exists():
+    if tmp.is_file():
         content = tmp.read_text().strip()
-        tmp.unlink()
+        _clear_tmp(tmp)
         return content
+    _clear_tmp(tmp)
     return None
 
 
