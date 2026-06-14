@@ -1,0 +1,13 @@
+# M4 (preprocessing) + Vast.ai A100 (training)
+qwen-tts
+torch
+transformers
+accelerate
+datasets
+soundfile
+librosa
+boto3
+pydub
+pyyaml
+requests
+deepspeed   # GPU-only, harmless if unused
