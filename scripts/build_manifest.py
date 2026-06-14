@@ -35,43 +35,64 @@ def resample_inplace_or_copy(src_path: Path, dst_path: Path):
     return dur
 
 
+# HiACC (Zenodo record 15551669, Corpus.zip) layout, verified by inspection:
+#   Corpus/adult/audio/{train,val,test}_split/<PID+num>.wav
+#   Corpus/adult/transcription/combined_output_changed_{train,val,test}_output.txt
+#   Corpus/children/audio/{train,val,test}_split/<PID+num>.wav
+#   Corpus/children/transcript/{train,val,test}_output.txt
+# Transcript lines are "<filename>.wav, <text>"; speaker_id is the 4-char PID
+# prefix of the filename (e.g. "AD09001.wav" -> "AD09", matching
+# metadata/speaker_info.csv's PID column).
+HIACC_TRANSCRIPT_FILES = {
+    "adult": {
+        "train": "transcription/combined_output_changed_train_output.txt",
+        "val": "transcription/combined_output_changed_val_output.txt",
+        "test": "transcription/combined_output_changed_test_output.txt",
+    },
+    "children": {
+        "train": "transcript/train_output.txt",
+        "val": "transcript/val_output.txt",
+        "test": "transcript/test_output.txt",
+    },
+}
+
+
 def find_hiacc_pairs(hiacc_dir: Path):
-    """
-    Walk HiACC extracted directory looking for audio files + matching transcripts.
-    HiACC's exact layout from Zenodo may vary; this looks for common patterns:
-      - a transcripts.csv / .tsv / .json with columns [audio_file, text, ...]
-      - or per-file .txt transcript siblings to .wav files
-    Adjust this function after inspecting the actual extracted structure.
-    """
+    """Walk the extracted HiACC Corpus/ directory and pair audio with transcripts."""
     pairs = []
 
-    # Pattern 1: look for any csv/tsv/json manifest files
-    for meta_file in hiacc_dir.rglob("*"):
-        if meta_file.suffix.lower() in (".csv", ".tsv", ".json", ".jsonl"):
-            print(f"  found potential metadata file: {meta_file}")
+    for category, split_files in HIACC_TRANSCRIPT_FILES.items():
+        category_dirs = [p for p in hiacc_dir.rglob("*") if p.is_dir() and p.name.lower() == category]
+        for category_dir in category_dirs:
+            for split, rel_path in split_files.items():
+                transcript_path = category_dir / rel_path
+                if not transcript_path.exists():
+                    continue
+                audio_dir = category_dir / "audio" / f"{split}_split"
+                with open(transcript_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or ", " not in line:
+                            continue
+                        fname, text = line.split(", ", 1)
+                        fname = fname.strip()
+                        text = text.strip()
+                        if not fname or not text:
+                            continue
+                        audio_path = audio_dir / fname
+                        if not audio_path.exists():
+                            continue
+                        pairs.append({
+                            "audio": str(audio_path),
+                            "text": text,
+                            "lang": "hinglish",
+                            "speaker_id": fname[:4],
+                            "source": f"hiacc_{category}_{split}",
+                        })
 
-    # Pattern 2: sibling .txt files next to .wav
-    wav_files = list(hiacc_dir.rglob("*.wav"))
-    print(f"  found {len(wav_files)} .wav files under {hiacc_dir}")
-    for wav in wav_files:
-        txt = wav.with_suffix(".txt")
-        if txt.exists():
-            text = txt.read_text(encoding="utf-8").strip()
-            subset = "children" if "child" in str(wav).lower() else "adult"
-            pairs.append({
-                "audio": str(wav),
-                "text": text,
-                "lang": "hinglish",
-                "speaker_id": wav.stem,
-                "source": f"hiacc_{subset}",
-            })
-
+    print(f"  found {len(pairs)} HiACC audio/transcript pairs under {hiacc_dir}")
     if not pairs:
-        print("  WARNING: no audio/transcript pairs found via .txt sibling pattern.")
-        print("  Inspect the extracted HiACC directory structure manually and either:")
-        print("    a) rename/restructure so .wav files have sibling .txt transcripts, or")
-        print("    b) extend find_hiacc_pairs() to parse the actual metadata file format")
-        print(f"  Extracted root: {hiacc_dir}")
+        print("  WARNING: no pairs found -- check download_hiacc.py output / Corpus/ layout")
 
     return pairs
 
@@ -147,6 +168,10 @@ def main():
             continue
         rec_out = dict(rec)
         rec_out["audio"] = str(dst.resolve())
+        # Self-reference: each clip is its own speaker reference for the
+        # Qwen3-TTS speaker encoder (multi-speaker full-FT, no grouping by
+        # speaker needed).
+        rec_out["ref_audio"] = rec_out["audio"]
         rec_out["duration"] = dur
         kept.append(rec_out)
         total_dur += dur

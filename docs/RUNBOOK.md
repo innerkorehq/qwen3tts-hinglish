@@ -13,7 +13,7 @@ Combined dataset is roughly **140 hours** (5.24 + 89.86 + 46.11), a known
 quantity up front — unlike the earlier IndicVoices-R-based plan, no dataset-size
 discovery step is needed.
 
-**Strategy: everything runs in a single Vast.ai A100 PCIe rental with a 200GB
+**Strategy: everything runs in a single Vast.ai A100 PCIe rental with a 250GB
 container disk, orchestrated by `scripts/orchestrate.py`.** From your M4, one
 command provisions the instance, clones this repo, and runs the entire pipeline
 end-to-end on `/root/work` (the instance's container disk):
@@ -39,7 +39,7 @@ teardown step, no local preprocessing on M4, and no separate volume to clean up
 
 ### Container disk architecture
 
-A single `vastai create instance ... --disk 200` provisions a 200GB container
+A single `vastai create instance ... --disk 250` provisions a 250GB container
 disk for the instance — no separate volume provisioning, no machine-pinning,
 no two-phase search. All pipeline data (`/root/work/data/`,
 `/root/work/models/`, `/root/work/checkpoints/`) lives on this disk. At the
@@ -48,9 +48,9 @@ to R2** (raw manifests, resampled audio, encoded codes, all checkpoint
 variants, logs) — `/root/work` disappears with the instance when destroyed, so
 nothing left only there survives. Note (from Vast.ai docs): container disk
 size is **fixed at instance creation** and can't be resized later — see "Disk
-budget" below for why 200GB is sized with headroom.
+budget" below for why 250GB is sized with headroom.
 
-### Disk budget (200GB container disk)
+### Disk budget (250GB container disk)
 
 Steady-state and peak-transient usage, assuming the full ~141hr dataset
 (HiACC 5.24hrs + SLR104 Hindi-English 89.86hrs + Bengali-English 46.11hrs):
@@ -69,13 +69,13 @@ Steady-state and peak-transient usage, assuming the full ~141hr dataset
 | Raw sliced audio (16kHz, before resample) — transient | +~16.3 GB |
 | **Peak transient total** (during build_manifest, before cleanup) | **~160 GB** |
 
-Against 200GB, that's **~40GB headroom at peak**. The onstart script removes
+Against 250GB, that's **~90GB headroom at peak**. The onstart script removes
 raw sliced audio (`./data/raw/slr104/*/audio`, `./data/raw/hiacc`) immediately
 after `resampled/` is built and backed up to R2, bringing usage back down to
 ~144GB for the encode/train phases.
 
 If `FAILED_BUILD_MANIFEST`, `FAILED_ENCODE_*`, or `FAILED_TRAIN` shows a disk
-space error in `pipeline_failed.log`, increase `--disk` (e.g. to 250) — remember
+space error in `pipeline_failed.log`, increase `--disk` (e.g. to 300) — remember
 this can't be changed after instance creation, so a failed run on insufficient
 disk requires a fresh instance.
 
@@ -116,6 +116,16 @@ export R2_BUCKET=qwen3tts-finetune-data
 export REPO_GIT_URL=https://github.com/yourname/qwen3tts-finetune.git
 ```
 
+Optionally, set this to enable manual SSH access to the instance (e.g. to
+`tail -f /root/pipeline.log` or poke around while the pipeline is running):
+```bash
+export VAST_SSH_PUBKEY_PATH=~/.ssh/id_ed25519.pub
+```
+If set, `orchestrate.py` attaches this key to the instance right after
+creation and prints `vastai ssh-url <id>` so you can connect with
+`ssh -i ~/.ssh/id_ed25519 $(vastai ssh-url <id> | sed 's#ssh://##')` (or just
+run `vastai ssh-url <id>` again later to get the connection string).
+
 No dataset auth tokens needed — OpenSLR-104 is a direct, ungated download
 (CC BY-SA 4.0), and HiACC is from Zenodo (also ungated).
 
@@ -137,7 +147,7 @@ anything. Use this to sanity-check pricing before committing.
 ```bash
 python3 scripts/orchestrate.py \
   --max-price 1.20 \
-  --disk 200 \
+  --disk 250 \
   --timeout-hours 30 \
   --slr104-pairs hindi-english bengali-english \
   --eval-frac 0.02
@@ -145,8 +155,8 @@ python3 scripts/orchestrate.py \
 
 Flags:
 - `--max-price` — max $/hr for A100 PCIe (searches `reliability>0.95` offers, picks cheapest)
-- `--disk` — container disk size in GB (default 200 — see "Disk budget" above;
-  steady-state ~144GB, peak transient ~160GB, ~40GB headroom). Fixed at
+- `--disk` — container disk size in GB (default 250 — see "Disk budget" above;
+  steady-state ~144GB, peak transient ~160GB, ~90GB headroom). Fixed at
   instance creation, can't be resized later.
 - `--timeout-hours` — safety net, not expected runtime (default 30)
 - `--slr104-pairs` — which OpenSLR-104 code-switched pairs to download
@@ -160,7 +170,7 @@ Flags:
 
 1. `search_offers()` finds the cheapest A100 PCIe offer with `disk_space >= --disk`
    and `reliability > 0.95`
-2. `create_instance()` launches it with `--disk 200` and an onstart script
+2. `create_instance()` launches it with `--disk 250` and an onstart script
    containing the full pipeline
 3. The instance immediately starts running in the background (no SSH needed)
 4. The orchestrator polls instance status + `/root/DONE` via `vastai copy` every
@@ -246,34 +256,34 @@ committing to the full run:
   larger and weren't downloaded for verification — their internal layout is
   likely the same (`<split>/transcripts/{wav.scp,segments,text}` with audio files
   in `<split>/`), but if `FAILED_DOWNLOAD_SLR104` occurs on the real run, check
-  `pipeline.log` for "could not find wav.scp+segments+text" first.
+  `pipeline.log` for "could not find wav.scp+segments+text" first. **This is the
+  one remaining unverified item** — see the small-pair smoke test below.
 - **`wav.scp` pipe-command entries**: the Bengali-English test split's `wav.scp`
   had 40/40 direct-path entries (no `sox ... |` pipes). Train tarballs may differ;
   `resolve_recording()`'s pipe-command branch (using `cat`/`sox` via shell) is
   exercised by the offline test but not against real pipe-command data.
-- **HiACC archive structure**: `download_hiacc.py` queries the Zenodo API and
-  extracts whatever it finds; `build_manifest.py`'s `find_hiacc_pairs()` assumes
-  `.wav` files with sibling `.txt` transcripts. If HiACC's actual layout differs,
-  this step may find 0 pairs — check `pipeline.log` for "found 0 .wav files"
-  warnings early.
-- **`encode_codes.py`'s `--device cuda` path and `train.py`'s audio-codes packing
-  format** (`preprocess()` in `train.py`) are placeholders pending verification
-  against the installed `qwen_tts` package's actual finetuning collator/tokenizer
-  API — these will fail fast at `FAILED_ENCODE_TRAIN` or `FAILED_TRAIN` if
-  mismatched.
-- **`train_config.yaml`** assumes `per_device_train_batch_size: 4` fits in A100 80GB
-  for a 1.7B full fine-tune with gradient checkpointing. If `FAILED_TRAIN` shows an
-  OOM, drop to `per_device_train_batch_size: 2` and double
-  `gradient_accumulation_steps` to keep the effective batch size constant.
+- ~~**HiACC archive structure**~~ — resolved. `find_hiacc_pairs()` has been
+  rewritten against the real downloaded `Corpus.zip` layout — see "HiACC corpus
+  structure" below.
+- ~~**`encode_codes.py`/`train.py` placeholders**~~ — resolved. Both now use the
+  real `qwen_tts` finetuning API (`Qwen3TTSTokenizer`, `Qwen3TTSModel` +
+  `accelerate`) — see "Pipeline internals: data format, encoding, and training"
+  below.
+- **`train_config.yaml` batch size**: `training.batch_size: 4` /
+  `gradient_accumulation_steps: 8` (effective batch 32) is the current best guess
+  for A100 80GB with a 1.7B full fine-tune. If `FAILED_TRAIN` shows an OOM, drop
+  `batch_size` to 2 and raise `gradient_accumulation_steps` to 16 (same effective
+  batch size).
 
 To validate the remaining items cheaply before the full ~140hr run, run with a
 single, smaller pair first:
 ```bash
-python3 scripts/orchestrate.py --slr104-pairs bengali-english --timeout-hours 6
+python3 scripts/orchestrate.py --slr104-pairs bengali-english --timeout-hours 6 --resume
 ```
 Bengali-English train alone is ~46hrs (3.9GB download) — a faster, cheaper
-(~$5-10) end-to-end pass that exercises every pipeline stage and surfaces the
-above issues before committing to the full Hindi-English + Bengali-English run.
+(~$5-10) end-to-end pass that exercises every pipeline stage (including the new
+encode/train code and `--resume` path) and surfaces the train-tarball structure
+issue above before committing to the full Hindi-English + Bengali-English run.
 
 ---
 
@@ -330,6 +340,125 @@ outside CUDA).
 
 ---
 
+## HiACC corpus structure
+
+`download_hiacc.py` pulls `Corpus.zip` from Zenodo record 15551669. Its real
+layout (verified by downloading and inspecting the archive):
+
+| Path | Contents |
+|---|---|
+| `Corpus/adult/audio/{train,val,test}_split/<PID+num>.wav` | Adult speaker audio |
+| `Corpus/adult/transcription/combined_output_changed_{train,val,test}_output.txt` | Adult transcripts |
+| `Corpus/children/audio/{train,val,test}_split/<PID+num>.wav` | Child speaker audio |
+| `Corpus/children/transcript/{train,val,test}_output.txt` | Child transcripts |
+
+Each transcript line is `<filename>.wav, <text>` (split on the first `, `).
+`find_hiacc_pairs()` (in `build_manifest.py`):
+- locates the `adult`/`children` directories under the extracted corpus
+  (case-insensitive `rglob`)
+- for each split's transcript file, resolves the audio path at
+  `<category>/audio/<split>_split/<filename>.wav`, skipping lines whose audio
+  file doesn't exist
+- sets `speaker_id` to the first 4 characters of the filename (matches the
+  `speaker_info.csv` PIDs, e.g. `AD09001.wav` -> `AD09`, `CH03001.wav` -> `CH03`)
+- sets `source` to `hiacc_{adult|children}_{split}` and `lang` to `"hinglish"`
+
+Covered by the offline test `tests/test_build_manifest.py`.
+
+---
+
+## Pipeline internals: data format, encoding, and training
+
+### Manifest schema
+
+Every record produced by `build_manifest.py` (HiACC + OpenSLR-104) has, after
+resampling:
+```json
+{"audio": "<path to 24kHz mono wav>", "ref_audio": "<same path>", "text": "...",
+ "lang": "hinglish", "speaker_id": "...", "source": "hiacc_adult_train"}
+```
+`ref_audio` is a **self-reference** — each clip is its own speaker reference for
+`model.speaker_encoder` during training. This is the simplest correct choice for
+a multi-speaker corpus: it avoids grouping clips by speaker, and every record
+already carries its own reference audio.
+
+### Encoding (`encode_codes.py`)
+
+Uses the real `qwen_tts` tokenizer API:
+```python
+tokenizer = Qwen3TTSTokenizer.from_pretrained(args.tokenizer_model, device_map=device)
+enc_res = tokenizer.encode([rec["audio"] for rec in batch])   # enc_res.audio_codes: list of (T,16) tensors
+```
+Batched (`--batch-size 32` default) with per-item fallback on batch failure.
+Output records add an `audio_codes` field (nested list, `(T,16)`) to each
+manifest record, written to `train_with_codes.jsonl` / `eval_with_codes.jsonl`.
+Restartable via `.partial` files + `load_done_keys()` + periodic checkpoint
+flush, same pattern as before.
+
+### Training (`train.py`)
+
+Not HF `Trainer` — a hand-rolled `accelerate` loop over `Qwen3TTSModel`, using
+`scripts/qwen_tts_dataset.py` (vendored verbatim from the official
+[`finetuning/dataset.py`](https://github.com/QwenLM/Qwen3-TTS/blob/main/finetuning/dataset.py),
+since it's not part of the `qwen-tts` pip package). The forward pass and loss
+follow [`finetuning/sft_12hz.py`](https://github.com/QwenLM/Qwen3-TTS/blob/main/finetuning/sft_12hz.py)
+exactly: text + codec embeddings, per-codebook embeddings for codebooks 1-15,
+`model.talker(...)` loss plus `0.3 * sub_talker_loss` from
+`forward_sub_talker_finetune()`.
+
+**Multi-speaker design decision**: the official script captures a *single*
+`target_speaker_embedding` from the first batch and bakes it into
+`codec_embedding.weight[3000]` plus `talker_config.spk_id`/`custom_voice` —
+a single-target-voice adaptation. This project is a general multi-speaker
+corpus, so `train.py` keeps the **per-sample** speaker embedding (from each
+record's own `ref_audio` via `model.speaker_encoder`) for training
+conditioning, but does **not** perform that bake-in at save time. Checkpoints
+stay loadable exactly like the Base model, with arbitrary `--ref_audio` at
+inference.
+
+Other details: cosine LR schedule with warmup
+(`get_cosine_schedule_with_warmup`), eval loop (mean loss over `eval_jsonl`)
+after each epoch, `--max-steps` for dry-run timing.
+
+**Checkpoint layout** under `./checkpoints/` (= `output_model_path`):
+
+| Path | Contents |
+|---|---|
+| `accel_state/` | `accelerator.save_state()` — model+optimizer+scheduler+RNG, overwritten each epoch |
+| `training_state.json` | `{epoch, global_step, best_eval_loss, best_epoch}` |
+| `best/` | Full HF-loadable checkpoint from the best-eval-loss epoch |
+| `final_fp32/`, `final_bf16/`, `final/` (alias of `final_fp32`) | Produced once at the end |
+
+---
+
+## Resuming a failed run
+
+`python3 scripts/orchestrate.py --resume ...` (pass the same other flags as the
+failed run) makes each pipeline stage check R2 for a prior run's output before
+recomputing it:
+
+- **Download + manifest**: if `manifest_raw.jsonl`, `manifest_eval_raw.jsonl`,
+  and `resampled/` all exist in R2, downloads them instead of re-downloading
+  HiACC/OpenSLR-104 and re-resampling.
+- **Encode**: if `train_with_codes.jsonl` and `eval_with_codes.jsonl` exist in
+  R2, downloads them instead of re-running `encode_codes.py`.
+- **Train**: if `accel_state/` and `training_state.json` exist in R2, downloads
+  them into `./checkpoints/` and passes `--resume` to `train.py`, which calls
+  `accelerator.load_state()` and reads `training_state.json` to skip already-
+  completed epochs.
+
+`train.py` itself uploads `accel_state/` + `training_state.json` (and `best/`
+if it improved) to R2 **after every epoch**, so a `FAILED_TRAIN` run is
+recoverable on a fresh instance via `--resume` without losing more than the
+current epoch's progress.
+
+**Caveat**: resume reuses R2 state as-is. If you change `train_config.yaml`
+(e.g. batch size, LR schedule) between runs, the restored optimizer/scheduler
+state in `accel_state/` may not match the new config — for substantial config
+changes, start a fresh run without `--resume` instead.
+
+---
+
 ## Verify and download results
 
 After `orchestrate.py` reports `SUCCESS`:
@@ -357,7 +486,7 @@ python3 scripts/upload_to_r2.py --download --recursive --bucket $R2_BUCKET \
 
 | Step | Where | Cost |
 |---|---|---|
-| Everything (download, resample, encode, train, convert, upload) | Vast.ai A100 PCIe + 200GB container disk via `orchestrate.py` | ~$1.20/hr x actual runtime (disk is included in `dph_total` for most offers) -- container destroyed on completion, no separate cleanup |
+| Everything (download, resample, encode, train, convert, upload) | Vast.ai A100 PCIe + 250GB container disk via `orchestrate.py` | ~$1.20/hr x actual runtime (disk is included in `dph_total` for most offers) -- container destroyed on completion, no separate cleanup |
 | R2 storage (raw manifests, resampled audio, codes, 3-4 checkpoint variants) | Cloudflare R2 | ~$0.015/GB/month, negligible |
 
 Total cost = (A100 hourly rate) x (download + resample + encode + train + convert
@@ -370,36 +499,60 @@ committing to the full two-pair run.
 
 ---
 
+## Troubleshooting
+
+- **`vastai copy ... Invalid src_full_path` during polling**: expected and
+  benign. `check_done_marker()` polls for `/root/DONE` via `vastai copy`
+  before the pipeline has finished, so the remote file doesn't exist yet --
+  the backend reports this as `Invalid src_full_path`. `orchestrate.py` runs
+  this check quietly and just treats it as "not done yet". If you see this
+  *after* `pipeline.log` shows the pipeline finished, something else is
+  wrong -- SSH in (see above) and check `/root/` directly.
+
+- **`vastai destroy instance <id>` hangs / prints "Aborted." after pressing
+  Enter**: the bare CLI prompts `Are you sure you want to destroy instance
+  ...? [y/N]` and a bare Enter defaults to **No**, so the instance is *not*
+  destroyed (billing continues!). Always pass `-y` for non-interactive use:
+  `vastai destroy instance <id> -y`. `orchestrate.py`'s `destroy_instance()`
+  already does this. If you ever end up with a leaked instance from a manual
+  `vastai destroy instance <id>` that printed "Aborted.", re-run it with `-y`
+  or destroy it from the Vast.ai web console.
+
+---
+
 ## Known gaps / TODO
 
-- [ ] **No resume/checkpoint-skip across runs** — if a run fails late (e.g.
-  `FAILED_TRAIN` after encoding completed), rerunning `orchestrate.py` starts over
-  from scratch on a fresh instance, though the manifest/codes backed up
-  to R2 from the failed run could in principle be downloaded instead of
-  regenerated. Not currently wired up.
-- [ ] **Disk size is fixed at instance creation** — if `--disk 200` proves
+- [x] **Resume/checkpoint-skip across runs** — `orchestrate.py --resume` now
+  checks R2 for each stage's prior output (manifest/resampled audio, encoded
+  codes, training `accel_state`/`training_state.json`) and downloads instead of
+  recomputing; `train.py --resume` picks up training mid-run. See "Resuming a
+  failed run".
+- [ ] **Disk size is fixed at instance creation** — if `--disk 250` proves
   insufficient (see "Disk budget"), a failed run can't be resized; a fresh
   instance with a larger `--disk` is required. The cleanup step
   (`./data/raw/slr104/*/audio`, `./data/raw/hiacc` removal after resampling)
   reduces peak usage from ~160GB to ~144GB, but hasn't been verified against
   real data sizes.
-- [ ] **`encode_codes.py`'s `--device cuda` path and `train.py`'s audio-codes
-  packing format** (`preprocess()`) are placeholders — verify against the
-  installed `qwen_tts` package, ideally via a small first run (see "Before your
-  first real run").
-- [ ] **HiACC zenodo archive structure** — `build_manifest.py`'s
-  `find_hiacc_pairs()` assumes `.wav` + sibling `.txt`; verify against actual
-  extracted layout.
+- [x] **`encode_codes.py`/`train.py`** now use the real `qwen_tts` finetuning API
+  (`Qwen3TTSTokenizer`, `Qwen3TTSModel` + `accelerate` + vendored
+  `TTSDataset`/`collate_fn`) — see "Pipeline internals: data format, encoding,
+  and training". Still needs a real-GPU smoke test (see "Before your first real
+  run").
+- [x] **HiACC zenodo archive structure** — `find_hiacc_pairs()` rewritten against
+  the real downloaded `Corpus.zip` layout; see "HiACC corpus structure". Covered
+  by `tests/test_build_manifest.py`.
 - [ ] **OpenSLR-104 Kaldi data dir structure and `wav.scp` pipe-command handling**
   — `download_slr104.py`'s `find_kaldi_dir()` and `resolve_recording()` are based
   on the standard Kaldi recipe layout described in the MUCS 2021 baseline, but
-  haven't been run against the actual extracted tarballs. A small first run (see
-  "Before your first real run") surfaces mismatches here cheaply.
+  haven't been run against the actual extracted **train** tarballs (only the
+  smaller test split was verified live). This is the **last remaining open item**
+  — the small-pair run below surfaces mismatches here cheaply.
 - [ ] **`FAILED_UPLOAD_MODEL` after successful training** is the worst-case
   failure — checkpoints exist only on the instance, which gets destroyed.
   Consider: don't destroy on this specific failure (leave instance running for
   manual recovery via `vastai copy`), or retry upload with backoff before giving
   up. Not currently differentiated from other failure modes.
-- [ ] **`train_config.yaml` batch size** assumes full FT of 1.7B fits on A100 80GB
-  with `per_device_train_batch_size: 4` + gradient checkpointing — unverified,
-  adjust if `FAILED_TRAIN` shows OOM.
+- [ ] **`train_config.yaml` batch size** (`batch_size: 4`,
+  `gradient_accumulation_steps: 8`) is the current best guess for full FT of
+  1.7B on A100 80GB — unverified on real hardware, adjust per the OOM fallback
+  if `FAILED_TRAIN` shows OOM.

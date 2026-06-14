@@ -6,7 +6,7 @@
 # separate steps in orchestrate.py's onstart pipeline — see docs/RUNBOOK.md.
 #
 # Usage (called from onstart script with cwd=/root/work, on the instance's
-# 200GB container disk):
+# 250GB container disk):
 #   bash /root/repo/scripts/bootstrap_vastai.sh
 
 set -euo pipefail
@@ -21,7 +21,7 @@ echo "Free space: ${FREE_GB}GB"
 if [ "$FREE_GB" -lt 100 ]; then
   echo "WARNING: less than 100GB free. Dataset downloads + resampled audio +"
   echo "1.7B model checkpoints (fp32/bf16/fp16 variants) may not fit."
-  echo "Consider increasing --disk on orchestrate.py (default 200, see"
+  echo "Consider increasing --disk on orchestrate.py (default 250, see"
   echo "docs/RUNBOOK.md 'Disk budget')."
 fi
 

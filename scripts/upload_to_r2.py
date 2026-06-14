@@ -19,6 +19,10 @@ Usage (upload directory recursively):
 Usage (download):
     python3 upload_to_r2.py --download --key finetune/train_with_codes.jsonl \
         --bucket my-bucket --file ./data/train_with_codes.jsonl
+
+Usage (existence check, for resume -- exit 0 if present, 1 if missing):
+    python3 upload_to_r2.py --exists --key finetune/train_with_codes.jsonl --bucket my-bucket
+    python3 upload_to_r2.py --exists --key finetune/checkpoints/final --bucket my-bucket --recursive
 """
 import argparse
 import os
@@ -90,13 +94,31 @@ def download_dir(client, bucket, key_prefix, local_dir):
     print(f"Downloaded {count} files from s3://{bucket}/{prefix} -> {local_dir}")
 
 
+def object_exists(client, bucket, key):
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def prefix_exists(client, bucket, key_prefix):
+    """True if any object exists under key_prefix/ (for directory uploads)."""
+    prefix = key_prefix.rstrip("/") + "/"
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return resp.get("KeyCount", 0) > 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", required=True, help="local path (upload source / download dest)")
+    ap.add_argument("--file", required=False, help="local path (upload source / download dest)")
     ap.add_argument("--key", required=True, help="remote object key (or prefix if --recursive)")
     ap.add_argument("--bucket", default=os.environ.get("R2_BUCKET"))
-    ap.add_argument("--recursive", action="store_true", help="upload a directory recursively")
+    ap.add_argument("--recursive", action="store_true", help="upload/check a directory recursively")
     ap.add_argument("--download", action="store_true", help="download instead of upload")
+    ap.add_argument("--exists", action="store_true",
+                    help="check whether --key (or --key prefix if --recursive) exists; "
+                         "prints EXISTS/MISSING and exits 0/1, no --file needed")
     args = ap.parse_args()
 
     if not args.bucket:
@@ -104,6 +126,16 @@ def main():
         sys.exit(1)
 
     client = get_client()
+
+    if args.exists:
+        found = prefix_exists(client, args.bucket, args.key) if args.recursive \
+            else object_exists(client, args.bucket, args.key)
+        print("EXISTS" if found else "MISSING")
+        sys.exit(0 if found else 1)
+
+    if not args.file:
+        print("ERROR: --file required (unless --exists)", file=sys.stderr)
+        sys.exit(1)
 
     if args.download:
         if args.recursive:

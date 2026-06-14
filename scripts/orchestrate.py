@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 End-to-end orchestrator for the Vast.ai A100 PCIe full pipeline, using a
-200GB container disk for all working data.
+250GB container disk for all working data.
 
 Flow (everything in one rental, see docs/RUNBOOK.md):
   1. Search vast.ai for A100 PCIe offers with >= --disk GB (cheapest reliable match)
-  2. Create an instance with --disk 200 (a single container disk -- no separate
+  2. Create an instance with --disk 250 (a single container disk -- no separate
      volume provisioning, no machine-pinning)
   3. Onstart script runs the whole pipeline on /root/work:
      bootstrap -> download HiACC + OpenSLR-104 (Hindi-English, Bengali-English)
@@ -22,18 +22,22 @@ for the run and disappears with the instance.
 
 Container disk sizing (see docs/RUNBOOK.md "Disk budget" for the full breakdown):
 steady-state usage is ~144GB, peak transient (raw + resampled audio coexisting
-during build_manifest) is ~160GB, against 200GB -- ~40GB headroom at peak.
+during build_manifest) is ~160GB, against 250GB -- ~90GB headroom at peak.
 
 Requires:
   - `vastai` CLI installed and authenticated (`vastai set api-key <key>`)
   - R2 env vars: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
   - REPO_GIT_URL pointing at a git remote with this project (cloned on the instance)
+  - (optional) VAST_SSH_PUBKEY_PATH pointing at a local SSH public key (.pub) --
+    if set, the key is attached to the instance after creation so you can SSH
+    in manually (e.g. `vastai ssh-url <id>`) to check progress or debug.
 
 Usage:
   export VAST_API_KEY=...
   export R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_BUCKET=...
   export REPO_GIT_URL=https://github.com/yourname/qwen3tts-finetune.git
-  python3 orchestrate.py --max-price 1.20 --disk 200 --timeout-hours 30
+  export VAST_SSH_PUBKEY_PATH=~/.ssh/id_ed25519.pub   # optional, for manual SSH access
+  python3 orchestrate.py --max-price 1.20 --disk 250 --timeout-hours 30
   python3 orchestrate.py --dry-run     # search + show chosen offer, don't create
 """
 import argparse
@@ -48,10 +52,11 @@ REPO_GIT_URL = os.environ.get("REPO_GIT_URL", "")  # set this to your git remote
 R2_PREFIX = "finetune/qwen3tts-hinglish"
 
 
-def run(cmd, check=True, capture=True):
-    print(f"$ {' '.join(cmd)}")
+def run(cmd, check=True, capture=True, quiet=False):
+    if not quiet:
+        print(f"$ {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=capture, text=True)
-    if capture:
+    if capture and not quiet:
         if result.stdout:
             print(result.stdout)
         if result.stderr:
@@ -87,7 +92,7 @@ def search_offers(max_price, min_disk, gpu="A100_PCIE"):
     return offers
 
 
-def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac):
+def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=False):
     """
     Generates the bash script that runs entirely on the remote instance via
     --onstart-cmd. Full pipeline, all on the instance's container disk under
@@ -96,6 +101,13 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac):
     (resample + split), encode codes, train, convert formats, upload results,
     write DONE marker. Errors are captured so the orchestrator can detect failure
     via the marker file content.
+
+    If resume=True, each stage first checks R2 for that stage's output (via
+    `upload_to_r2.py --exists`) and downloads it instead of recomputing if
+    present -- see docs/RUNBOOK.md "Resuming a failed run". Training resume
+    (accel_state/training_state.json) is handled the same way and passed to
+    train.py via --resume; train.py itself uploads accel_state/training_state
+    (and the best checkpoint) to R2 after each epoch.
     """
     if not REPO_GIT_URL:
         print("WARNING: REPO_GIT_URL is not set. The onstart script will expect", file=sys.stderr)
@@ -107,6 +119,7 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac):
     SLR104_PAIRS = " ".join(slr104_pairs)
     SLR104_TEST_ARG = "--include-test" if slr104_include_test else ""
     EVAL_FRAC = eval_frac
+    RESUME = "1" if resume else "0"
 
     script = f"""#!/bin/bash
 set -uo pipefail
@@ -143,69 +156,129 @@ fi
 # --- 1. bootstrap deps + base model (downloads base model into /root/work/models) ---
 bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 1; }}
 
-# --- 2. download datasets directly onto the container disk ---
-python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
-  || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
-
-python3 "$REPO/scripts/download_slr104.py" \\
-  --out-dir ./data/raw/slr104 \\
-  --pairs {SLR104_PAIRS} \\
-  {SLR104_TEST_ARG} \\
-  || {{ mark_done FAILED_DOWNLOAD_SLR104; exit 1; }}
-
-# --- 3. build unified manifest (resample to 24kHz mono, filter, train/eval split) ---
-python3 "$REPO/scripts/build_manifest.py" \\
-  --hiacc-dir ./data/raw/hiacc \\
-  --slr104-dir ./data/raw/slr104 \\
-  --out ./data/manifest_raw.jsonl \\
-  --resampled-dir ./data/resampled \\
-  --eval-frac {EVAL_FRAC} \\
-  || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-
-# build_manifest.py writes the eval split as manifest_eval_raw.jsonl alongside
-# the requested --out path (same stem with _eval_raw suffix)
-if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
-  mark_done FAILED_BUILD_MANIFEST; exit 1
+# --- 2/3. download datasets + build unified manifest (resample to 24kHz mono,
+#          filter, train/eval split) -- or, with --resume, reuse a prior run's
+#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled from R2 ---
+RESUME_MANIFEST=0
+if [ "{RESUME}" = "1" ]; then
+  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/manifest_raw.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/manifest_eval_raw.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --exists --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled; then
+    RESUME_MANIFEST=1
+  fi
 fi
 
-# Backup raw manifests + resampled audio to R2 (important intermediary artifacts --
-# if encoding or training fails later, you don't have to re-download/re-resample
-# on a fresh rental)
-python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/manifest_raw.jsonl
-python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/manifest_eval_raw.jsonl
-python3 "$REPO/scripts/upload_to_r2.py" --file ./data/resampled --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/resampled --recursive
+if [ "$RESUME_MANIFEST" = "1" ]; then
+  echo "--resume: found manifest + resampled audio in R2, downloading instead of rebuilding"
+  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled --file ./data/resampled \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+else
+  python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
+    || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
 
-# Free up disk: raw sliced audio (16kHz, from download_slr104.py / download_hiacc.py)
-# is no longer needed once resampled/ exists. This matters at our disk budget --
-# see docs/RUNBOOK.md "Disk budget".
-rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
+  python3 "$REPO/scripts/download_slr104.py" \\
+    --out-dir ./data/raw/slr104 \\
+    --pairs {SLR104_PAIRS} \\
+    {SLR104_TEST_ARG} \\
+    || {{ mark_done FAILED_DOWNLOAD_SLR104; exit 1; }}
 
-# --- 4. encode audio -> codes ---
-python3 "$REPO/scripts/encode_codes.py" \\
-  --manifest ./data/manifest_raw.jsonl \\
-  --out ./data/train_with_codes.jsonl \\
-  --device cuda --batch-size 16 \\
-  || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
+  python3 "$REPO/scripts/build_manifest.py" \\
+    --hiacc-dir ./data/raw/hiacc \\
+    --slr104-dir ./data/raw/slr104 \\
+    --out ./data/manifest_raw.jsonl \\
+    --resampled-dir ./data/resampled \\
+    --eval-frac {EVAL_FRAC} \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
 
-python3 "$REPO/scripts/encode_codes.py" \\
-  --manifest ./data/manifest_eval_raw.jsonl \\
-  --out ./data/eval_with_codes.jsonl \\
-  --device cuda --batch-size 16 \\
-  || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
+  # build_manifest.py writes the eval split as manifest_eval_raw.jsonl alongside
+  # the requested --out path (same stem with _eval_raw suffix)
+  if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
+    mark_done FAILED_BUILD_MANIFEST; exit 1
+  fi
 
-# Backup encoded codes to R2 (important intermediary artifact -- small files)
-python3 "$REPO/scripts/upload_to_r2.py" --file ./data/train_with_codes.jsonl --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/train_with_codes.jsonl
-python3 "$REPO/scripts/upload_to_r2.py" --file ./data/eval_with_codes.jsonl --bucket "$R2_BUCKET" \\
-  --key {R2_PREFIX}/eval_with_codes.jsonl
+  # Backup raw manifests + resampled audio to R2 (important intermediary artifacts --
+  # if encoding or training fails later, you don't have to re-download/re-resample
+  # on a fresh rental)
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/manifest_raw.jsonl
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/manifest_eval_raw.jsonl
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/resampled --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled --recursive
 
-# --- 5. train (produces final_fp32, final_bf16, final aliased to fp32) ---
-# train_config.yaml paths (base_model_path, output_dir, data files) are
+  # Free up disk: raw sliced audio (16kHz, from download_slr104.py / download_hiacc.py)
+  # is no longer needed once resampled/ exists. This matters at our disk budget --
+  # see docs/RUNBOOK.md "Disk budget".
+  rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
+fi
+
+# --- 4. encode audio -> codes -- or, with --resume, reuse a prior run's
+#        train_with_codes.jsonl/eval_with_codes.jsonl from R2 ---
+RESUME_CODES=0
+if [ "{RESUME}" = "1" ]; then
+  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/train_with_codes.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/eval_with_codes.jsonl; then
+    RESUME_CODES=1
+  fi
+fi
+
+if [ "$RESUME_CODES" = "1" ]; then
+  echo "--resume: found encoded codes in R2, downloading instead of re-encoding"
+  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/train_with_codes.jsonl --file ./data/train_with_codes.jsonl \\
+    || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
+  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/eval_with_codes.jsonl --file ./data/eval_with_codes.jsonl \\
+    || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
+else
+  python3 "$REPO/scripts/encode_codes.py" \\
+    --manifest ./data/manifest_raw.jsonl \\
+    --out ./data/train_with_codes.jsonl \\
+    --device cuda --batch-size 32 \\
+    || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
+
+  python3 "$REPO/scripts/encode_codes.py" \\
+    --manifest ./data/manifest_eval_raw.jsonl \\
+    --out ./data/eval_with_codes.jsonl \\
+    --device cuda --batch-size 32 \\
+    || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
+
+  # Backup encoded codes to R2 (important intermediary artifact -- small files)
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/train_with_codes.jsonl --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/train_with_codes.jsonl
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/eval_with_codes.jsonl --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/eval_with_codes.jsonl
+fi
+
+# --- 5. train (produces final_fp32, final_bf16, final aliased to fp32) -- or,
+#        with --resume, reuse a prior run's accel_state/training_state.json
+#        from R2 and continue from there ---
+TRAIN_RESUME_FLAG=""
+if [ "{RESUME}" = "1" ]; then
+  if python3 "$REPO/scripts/upload_to_r2.py" --exists --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/accel_state \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/training_state.json; then
+    echo "--resume: found training checkpoint in R2, downloading"
+    python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/accel_state --file ./checkpoints/accel_state
+    python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/training_state.json --file ./checkpoints/training_state.json
+    TRAIN_RESUME_FLAG="--resume"
+  fi
+fi
+
+# train_config.yaml paths (init_model_path, output_model_path, data files) are
 # relative to cwd, which is /root/work here -- see configs/train_config.yaml comment.
-python3 "$REPO/scripts/train.py" --config "$REPO/configs/train_config.yaml" \\
+# train.py itself uploads accel_state/training_state.json/best to R2 after each
+# epoch (if R2 env vars are set, which they are above) -- this is what makes
+# FAILED_TRAIN recoverable via --resume on a fresh instance.
+python3 "$REPO/scripts/train.py" --config "$REPO/configs/train_config.yaml" $TRAIN_RESUME_FLAG \\
   || {{ mark_done FAILED_TRAIN; exit 1; }}
 
 # --- 6. convert fp32 master -> fp16 (for MPS/M4 inference) ---
@@ -282,15 +355,22 @@ def get_instance_status(instance_id):
 
 
 def check_done_marker(instance_id):
-    """SSH-free check via `vastai copy` of the DONE marker file, if it exists."""
+    """SSH-free check via `vastai copy` of the DONE marker file, if it exists.
+
+    Before the pipeline finishes, /root/DONE doesn't exist yet and `vastai copy`
+    prints an "Invalid src_full_path" error to stderr for the missing remote
+    file -- this is expected/benign on every poll until the marker is written,
+    so the command runs quietly and absence is detected by the local tmp file
+    never being created.
+    """
     tmp = Path("/tmp/DONE_marker_check")
     if tmp.exists():
         tmp.unlink()
-    result = run([
+    run([
         "vastai", "copy",
         f"{instance_id}:/root/DONE",
         f"local:{tmp}",
-    ], check=False)
+    ], check=False, quiet=True)
     if tmp.exists():
         content = tmp.read_text().strip()
         tmp.unlink()
@@ -298,15 +378,23 @@ def check_done_marker(instance_id):
     return None
 
 
+def attach_ssh_key(instance_id, ssh_pubkey_path):
+    """Attach a public key to the instance for manual `vastai ssh-url` access."""
+    pubkey = Path(ssh_pubkey_path).expanduser().read_text().strip()
+    run(["vastai", "attach", "ssh", str(instance_id), pubkey], check=False)
+
+
 def destroy_instance(instance_id):
-    run(["vastai", "destroy", "instance", str(instance_id)], check=False)
+    # -y skips the interactive "Are you sure?" confirmation prompt, which
+    # would otherwise hang (or abort on a bare Enter) in non-interactive use.
+    run(["vastai", "destroy", "instance", str(instance_id), "-y"], check=False)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-price", type=float, default=1.20, help="max $/hr for A100 PCIe")
-    ap.add_argument("--disk", type=int, default=200,
-                    help="container disk size in GB (default 200 -- see "
+    ap.add_argument("--disk", type=int, default=250,
+                    help="container disk size in GB (default 250 -- see "
                          "docs/RUNBOOK.md 'Disk budget' for the breakdown; "
                          "steady-state ~144GB, peak transient ~160GB)")
     ap.add_argument("--gpu", default="A100_PCIE")
@@ -321,6 +409,10 @@ def main():
                     help="also download the (smaller) OpenSLR-104 test splits")
     ap.add_argument("--eval-frac", type=float, default=0.02,
                     help="fraction of combined dataset held out for eval")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume a previously failed run: each pipeline stage checks R2 "
+                         "for that stage's output first and downloads it instead of "
+                         "recomputing if present (see docs/RUNBOOK.md 'Resuming a failed run')")
     ap.add_argument("--dry-run", action="store_true", help="search and show offer only, don't create")
     args = ap.parse_args()
 
@@ -351,8 +443,11 @@ def main():
         slr104_pairs=args.slr104_pairs,
         slr104_include_test=args.slr104_include_test,
         eval_frac=args.eval_frac,
+        resume=args.resume,
     ))
     print(f"\\nGenerated onstart script -> {onstart_path}")
+    if args.resume:
+        print("--resume set: each stage will check R2 for prior outputs before recomputing.")
 
     print("\\nCreating instance ...")
     instance_id = None
@@ -361,6 +456,15 @@ def main():
     try:
         instance_id = create_instance(best["id"], args.disk, onstart_path)
         print(f"Instance created: id={instance_id}")
+
+        ssh_pubkey_path = os.environ.get("VAST_SSH_PUBKEY_PATH")
+        if ssh_pubkey_path:
+            print(f"Attaching SSH key from {ssh_pubkey_path} ...")
+            attach_ssh_key(instance_id, ssh_pubkey_path)
+            run(["vastai", "ssh-url", str(instance_id)], check=False)
+            print("(use the URL above to SSH in manually and inspect /root/pipeline.log)")
+        else:
+            print("VAST_SSH_PUBKEY_PATH not set -- skipping manual SSH access setup.")
         print("Pipeline is now running in the background via onstart script.")
         print("Polling for completion ...")
 

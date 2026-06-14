@@ -3,22 +3,24 @@
 Encode audio files into discrete codes using Qwen3-TTS-Tokenizer-12Hz.
 Restartable: checkpoints progress, skips already-encoded entries on rerun.
 
+Follows the official prepare_data.py batched encode API
+(https://github.com/QwenLM/Qwen3-TTS/blob/main/finetuning/prepare_data.py):
+Qwen3TTSTokenizer.from_pretrained(path, device_map=...).encode(list_of_paths)
+-> enc_res.audio_codes (list of (T, 16) tensors).
+
 Usage:
     python3 encode_codes.py \
         --manifest ./data/manifest_raw.jsonl \
         --out ./data/train_with_codes.jsonl \
         --tokenizer-model Qwen/Qwen3-TTS-Tokenizer-12Hz \
-        --device mps \
-        --batch-size 8
+        --device cuda \
+        --batch-size 32
 """
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-
-import torch
-import soundfile as sf
 
 
 def load_done_keys(out_path: Path):
@@ -39,13 +41,40 @@ def load_done_keys(out_path: Path):
     return done
 
 
+def encode_batch(tokenizer, records):
+    """Encode a batch of records, falling back to per-item encoding on batch failure."""
+    paths = [r["audio"] for r in records]
+    try:
+        enc_res = tokenizer.encode(paths)
+        out = []
+        for code, rec in zip(enc_res.audio_codes, records):
+            rec_out = dict(rec)
+            rec_out["audio_codes"] = code.cpu().tolist()
+            out.append(rec_out)
+        return out, []
+    except Exception as e:
+        print(f"  batch encode failed ({e}), falling back to per-item encoding")
+        out = []
+        failed = []
+        for rec in records:
+            try:
+                enc_res = tokenizer.encode([rec["audio"]])
+                rec_out = dict(rec)
+                rec_out["audio_codes"] = enc_res.audio_codes[0].cpu().tolist()
+                out.append(rec_out)
+            except Exception as e2:
+                print(f"    skip (encode error): {rec['audio']}: {e2}")
+                failed.append(rec)
+        return out, failed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--tokenizer-model", default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
-    ap.add_argument("--device", default="mps", choices=["mps", "cuda", "cpu"])
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--device", default="cuda", choices=["mps", "cuda", "cpu"])
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--checkpoint-every", type=int, default=200,
                     help="flush partial progress to disk every N samples")
     args = ap.parse_args()
@@ -54,11 +83,12 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     partial_path = out_path.with_suffix(out_path.suffix + ".partial")
 
-    # Device check / fallback
     device = args.device
-    if device == "mps" and not torch.backends.mps.is_available():
-        print("WARNING: MPS not available, falling back to CPU. This will be slow.")
-        device = "cpu"
+    if device == "mps":
+        import torch
+        if not torch.backends.mps.is_available():
+            print("WARNING: MPS not available, falling back to CPU. This will be slow.")
+            device = "cpu"
     print(f"Using device: {device}")
 
     print(f"Loading tokenizer model: {args.tokenizer_model} ...")
@@ -68,9 +98,7 @@ def main():
         print("ERROR: `qwen_tts` package not found. Install with: pip install qwen-tts", file=sys.stderr)
         sys.exit(1)
 
-    tokenizer = Qwen3TTSTokenizer.from_pretrained(args.tokenizer_model)
-    tokenizer = tokenizer.to(device)
-    tokenizer.eval()
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(args.tokenizer_model, device_map=device)
 
     done_keys = load_done_keys(out_path)
     print(f"Found {len(done_keys)} already-encoded entries, will skip these.")
@@ -89,42 +117,24 @@ def main():
     pf = open(partial_path, "a")
     processed_since_flush = 0
 
-    with torch.no_grad():
-        for i, rec in enumerate(todo):
-            audio_path = rec["audio"]
-            try:
-                wav, sr = sf.read(audio_path)
-            except Exception as e:
-                print(f"  [{i}] skip (read error): {audio_path}: {e}")
-                continue
-
-            try:
-                wav_tensor = torch.tensor(wav, dtype=torch.float32, device=device)
-                if wav_tensor.ndim > 1:
-                    wav_tensor = wav_tensor.mean(dim=-1)
-                codes = tokenizer.encode(wav_tensor.unsqueeze(0), sample_rate=sr)
-                # codes expected shape: [num_codebooks, T] or similar; convert to nested list
-                codes_list = codes.cpu().tolist()
-            except Exception as e:
-                print(f"  [{i}] skip (encode error): {audio_path}: {e}")
-                continue
-
-            rec_out = dict(rec)
-            rec_out["audio_codes"] = codes_list
+    for i in range(0, len(todo), args.batch_size):
+        batch = todo[i:i + args.batch_size]
+        encoded, _failed = encode_batch(tokenizer, batch)
+        for rec_out in encoded:
             pf.write(json.dumps(rec_out, ensure_ascii=False) + "\n")
-            processed_since_flush += 1
+        processed_since_flush += len(encoded)
 
-            if (i + 1) % 50 == 0:
-                print(f"  [{i+1}/{len(todo)}] encoded")
+        done_so_far = min(i + args.batch_size, len(todo))
+        print(f"  [{done_so_far}/{len(todo)}] encoded")
 
-            if processed_since_flush >= args.checkpoint_every:
-                pf.flush()
-                os.fsync(pf.fileno())
-                processed_since_flush = 0
+        if processed_since_flush >= args.checkpoint_every:
+            pf.flush()
+            os.fsync(pf.fileno())
+            processed_since_flush = 0
 
     pf.close()
 
-    # Merge partial into final output (append-only — safe to rerun)
+    # Merge partial into final output (append-only -- safe to rerun)
     print("Merging partial results into final output ...")
     with open(out_path, "a") as out_f, open(partial_path) as in_f:
         for line in in_f:

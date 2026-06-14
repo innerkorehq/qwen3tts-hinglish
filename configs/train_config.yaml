@@ -1,72 +1,72 @@
 # Qwen3-TTS-12Hz-1.7B-Base full fine-tune config
 # Combined manifest: HiACC (adult + children, Hinglish) + OpenSLR-104 (Hindi-English, Bengali-English code-switched)
 #
-# In the single-A100 orchestrated flow (orchestrate.py), base_model_path,
-# train_file, and eval_file are produced earlier in the SAME onstart script run
-# (bootstrap downloads the base model to /root/work/models; build_manifest.py +
-# encode_codes.py produce the data files under /root/work/data). All paths are
-# relative to cwd=/root/work (on the instance's 200GB container disk).
+# In the single-A100 orchestrated flow (orchestrate.py), init_model_path,
+# train_jsonl, and eval_jsonl are produced earlier in the SAME onstart script
+# run (bootstrap downloads the base model to /root/work/models; build_manifest.py
+# + encode_codes.py produce the data files under /root/work/data). All paths
+# are relative to cwd=/root/work (on the instance's 250GB container disk).
 #
-# Dataset size: ~141hrs total → ~63k clips (at ~8s avg segment)
-# Effective batch: 4 × 8 = 32 → ~1,985 steps/epoch
+# Training uses a hand-rolled `accelerate` loop (scripts/train.py) following
+# the official finetuning reference
+# (https://github.com/QwenLM/Qwen3-TTS/blob/main/finetuning/sft_12hz.py),
+# NOT a HF Trainer. This is a general multi-speaker full fine-tune: the
+# per-sample speaker embedding (from each record's own ref_audio, via
+# model.speaker_encoder) is used during training as in the reference, but we
+# do NOT bake a single global speaker embedding into codec_embedding[3000]
+# ("custom_voice"/spk_id adaptation) at save time -- checkpoints stay loadable
+# like the Base model with arbitrary --ref_audio at inference.
+#
+# Dataset size: ~141hrs total -> ~63k clips (at ~8s avg segment)
+# Effective batch: 4 x 8 = 32 -> ~1,985 steps/epoch
 
 model:
-  base_model_path: ./models/Qwen3-TTS-12Hz-1.7B-Base
-  output_dir: ./checkpoints
+  init_model_path: ./models/Qwen3-TTS-12Hz-1.7B-Base
+  output_model_path: ./checkpoints
+  # "flash_attention_2" (used by the official reference) requires the
+  # separately-installed `flash-attn` package, which bootstrap_vastai.sh does
+  # not install. "sdpa" works out of the box on the A100 image.
+  attn_implementation: sdpa
 
 data:
-  train_file: ./data/train_with_codes.jsonl
-  eval_file: ./data/eval_with_codes.jsonl
+  train_jsonl: ./data/train_with_codes.jsonl
+  eval_jsonl: ./data/eval_with_codes.jsonl
 
 training:
-  full_finetune: true
-
   # --- Epochs ---
-  # Reduced from 3 → 2. With ~63k clips and 1.7B params, the tokens-to-params
-  # ratio is only ~0.1x per epoch — 3 epochs almost certainly overfits.
-  # 2 epochs is aggressive but manageable with eval_steps monitoring + the
-  # load_best_model_at_end flag below. If eval loss is still decreasing at
-  # epoch 2, consider a follow-up run with num_train_epochs: 3.
-  num_train_epochs: 2
+  # Reduced from 3 -> 2. With ~63k clips and 1.7B params, the tokens-to-params
+  # ratio is only ~0.1x per epoch -- 3 epochs almost certainly overfits.
+  # 2 epochs is aggressive but manageable with the per-epoch eval loop below.
+  # If eval loss is still decreasing at epoch 2, consider a follow-up run with
+  # num_epochs: 3 (use --resume to continue from the saved checkpoint).
+  num_epochs: 2
 
   # --- Batch size ---
-  # effective = per_device × gradient_accumulation = 4 × 8 = 32
-  # ~1,985 steps/epoch → ~3,970 total steps over 2 epochs
-  per_device_train_batch_size: 4
+  # effective = batch_size x gradient_accumulation_steps = 4 x 8 = 32
+  # ~1,985 steps/epoch -> ~3,970 total steps over 2 epochs
+  batch_size: 4
   gradient_accumulation_steps: 8
 
   # --- Learning rate ---
   # 1e-5 is conservative for full FT of 1.7B but appropriate given the small
   # dataset-to-model ratio. Higher (2e-5) risks faster overfitting; lower
   # (5e-6) may underfit in only 2 epochs. Start here, check the loss curve.
-  learning_rate: 1.0e-5
+  lr: 1.0e-5
   lr_scheduler_type: cosine
-  warmup_ratio: 0.05            # ~199 steps warmup (up from 0.03 for more stable start)
+  warmup_ratio: 0.05            # ~199 steps warmup
 
   # --- Regularization ---
   weight_decay: 0.01
   max_grad_norm: 1.0             # gradient clipping for training stability
 
-  # --- Precision & memory ---
-  bf16: true
-  gradient_checkpointing: true   # needed for 1.7B full FT on single A100 80GB
+  # --- Precision ---
+  mixed_precision: bf16
 
   # --- Logging & eval ---
   logging_steps: 10
-  eval_steps: 200                # ~20 evals over 2 epochs — frequent enough to catch overfitting early
-  eval_strategy: steps
-
-  # --- Checkpointing ---
-  # save_steps MUST equal eval_steps when load_best_model_at_end is true,
-  # otherwise the best eval checkpoint may not exist on disk.
-  save_steps: 200                # aligned with eval_steps (~20 saves over 2 epochs)
-  save_total_limit: 3            # keep last 3 + best checkpoint (~68GB peak)
-  # Save the checkpoint with the best eval loss, not just the last one.
-  # This is the primary overfitting defense: if epoch 2 starts to overfit,
-  # the best model from mid-training is preserved.
-  load_best_model_at_end: true
-  metric_for_best_model: eval_loss
-  greater_is_better: false
+  # Eval runs once per epoch (over eval_jsonl) -- with only 2 epochs this is
+  # frequent enough to catch overfitting; the best-eval epoch's checkpoint is
+  # saved separately to ./checkpoints/best.
 
   # --- Data loading ---
   dataloader_num_workers: 4      # parallel data loading from container disk I/O
@@ -75,24 +75,13 @@ training:
   # --- Reproducibility ---
   seed: 42
 
-  # No resume/interruption handling per decision — single stable run assumed.
-  resume_from_checkpoint: false
-
-eval:
-  generate_samples: true
-  num_eval_samples: 8
-  sample_output_dir: ./samples
-
 # Notes:
-# - Container disk budget: at training time, usage is ~144GB of 200GB available
-#   (3 recent + 1 best checkpoint ≈ 68GB, resampled audio 24GB, base model 7GB,
-#   final saves 14GB, misc). See docs/RUNBOOK.md "Disk budget" for the full
-#   breakdown including the peak-transient phase during build_manifest.
-# - If OOM on 80GB A100: drop per_device_train_batch_size to 2 and raise
-#   gradient_accumulation_steps to 16 (keeps effective batch size at 32)
-# - Sequence lengths with placeholder packing (16 codebooks × T + text):
-#   avg ~1,566 tokens (8s clip), max ~5,810 tokens (30s clip). Variable-length
-#   padding may waste compute on mixed-length batches — future improvement:
-#   sort/bucket by duration before encoding.
-# - The preprocess() packing in train.py is a PLACEHOLDER — verify against the
-#   installed qwen_tts package's actual finetuning collator before running for real.
+# - Container disk budget: see docs/RUNBOOK.md "Disk budget" for the full
+#   breakdown. Per-epoch checkpoints are NOT accumulated -- only the latest
+#   `accel_state/` (for --resume) and `best/` (best eval epoch) are kept on
+#   disk, plus final_fp32/final_bf16/final at the end.
+# - If OOM on 80GB A100: drop batch_size to 2 and raise
+#   gradient_accumulation_steps to 16 (keeps effective batch size at 32).
+# - Resuming: `python3 train.py --config ... --resume` picks up from
+#   ./checkpoints/accel_state + training_state.json if present (see
+#   docs/RUNBOOK.md "Resuming a failed run").
