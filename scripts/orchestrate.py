@@ -88,16 +88,23 @@ def run(cmd, check=True, capture=True, quiet=False):
     return result
 
 
-def search_offers(max_price, min_disk, gpu="A100_PCIE"):
-    """Search vast.ai for A100 PCIe offers with enough disk, sorted by price."""
+def search_offers(max_price, min_disk, gpu=("A100_PCIE",), min_reliability=0.95, min_vram_gb=None):
+    """Search vast.ai for offers matching any of `gpu` (e.g. A100_PCIE and/or
+    A100_SXM4) with enough disk/VRAM/reliability, sorted by price."""
+    if len(gpu) == 1:
+        gpu_clause = f"gpu_name={gpu[0]}"
+    else:
+        gpu_clause = f"gpu_name in [{','.join(gpu)}]"
     query = (
-        f"gpu_name={gpu} "
+        f"{gpu_clause} "
         f"num_gpus=1 "
-        f"reliability>0.95 "
+        f"reliability>{min_reliability} "
         f"dph_total<={max_price} "
         f"disk_space>={min_disk} "
         f"rentable=true"
     )
+    if min_vram_gb is not None:
+        query += f" gpu_ram>={min_vram_gb * 1024}"
     result = run(["vastai", "search", "offers", query, "--raw"], check=True)
     try:
         offers = json.loads(result.stdout)
@@ -582,7 +589,14 @@ def main():
                     help="container disk size in GB (default 250 -- see "
                          "docs/RUNBOOK.md 'Disk budget' for the breakdown; "
                          "steady-state ~144GB, peak transient ~160GB)")
-    ap.add_argument("--gpu", default="A100_PCIE")
+    ap.add_argument("--gpu", nargs="+", default=["A100_PCIE"],
+                    help="vast.ai gpu_name(s) to search, e.g. --gpu A100_PCIE A100_SXM4 "
+                         "(default A100_PCIE; cheapest matching offer across all given wins)")
+    ap.add_argument("--min-vram", type=int, default=None, metavar="GB",
+                    help="minimum GPU VRAM in GB (e.g. 80 to require the 80GB A100 "
+                         "variant, excluding 40GB offers)")
+    ap.add_argument("--min-reliability", type=float, default=0.95,
+                    help="minimum vast.ai reliability score, 0-1 (default 0.95)")
     ap.add_argument("--poll-interval", type=int, default=300,
                     help="seconds between status checks (default 300 for long runs)")
     ap.add_argument("--timeout-hours", type=float, default=30.0,
@@ -620,9 +634,12 @@ def main():
         print(f"Re-attaching to instance {instance_id} -- skipping offer search/creation.")
         print("Polling for completion ...")
     else:
-        print(f"Searching for {args.gpu} offers under ${args.max_price}/hr "
-              f"with >= {args.disk}GB disk ...")
-        offers = search_offers(args.max_price, args.disk, gpu=args.gpu)
+        vram_msg = f", >= {args.min_vram}GB VRAM" if args.min_vram else ""
+        print(f"Searching for {'/'.join(args.gpu)} offers under ${args.max_price}/hr "
+              f"with >= {args.disk}GB disk{vram_msg}, "
+              f"reliability > {args.min_reliability} ...")
+        offers = search_offers(args.max_price, args.disk, gpu=args.gpu,
+                                min_reliability=args.min_reliability, min_vram_gb=args.min_vram)
         best = offers[0]
         print(f"\\nTop {min(5, len(offers))} offers:")
         for o in offers[:5]:
