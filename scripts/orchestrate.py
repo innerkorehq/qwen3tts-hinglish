@@ -61,6 +61,7 @@ Usage:
   python3 orchestrate.py --max-price 1.20 --disk 250 --timeout-hours 30
   python3 orchestrate.py --dry-run     # search + show chosen offer, don't create
 """
+
 import argparse
 import json
 import os
@@ -70,7 +71,9 @@ import sys
 import time
 from pathlib import Path
 
-REPO_GIT_URL = os.environ.get("REPO_GIT_URL", "")  # set this to your git remote with these scripts
+REPO_GIT_URL = os.environ.get(
+    "REPO_GIT_URL", ""
+)  # set this to your git remote with these scripts
 R2_PREFIX = "finetune/qwen3tts-hinglish"
 
 
@@ -88,7 +91,9 @@ def run(cmd, check=True, capture=True, quiet=False):
     return result
 
 
-def search_offers(max_price, min_disk, gpu=None, min_reliability=0.95, min_vram_gb=None):
+def search_offers(
+    max_price, min_disk, gpu=None, min_reliability=0.95, min_vram_gb=None
+):
     """Search vast.ai for offers matching any of `gpu` (e.g. A100_PCIE and/or
     A100_SXM4) with enough disk/VRAM/reliability, sorted by price. If `gpu` is
     None/empty, no gpu_name filter is applied (any GPU)."""
@@ -105,13 +110,16 @@ def search_offers(max_price, min_disk, gpu=None, min_reliability=0.95, min_vram_
         else:
             clauses.insert(0, f"gpu_name in [{','.join(gpu)}]")
     if min_vram_gb is not None:
-        clauses.append(f"gpu_ram>={min_vram_gb * 1024}")
+        clauses.append(f"gpu_ram>={min_vram_gb}")
     query = " ".join(clauses)
     result = run(["vastai", "search", "offers", query, "--raw"], check=True)
     try:
         offers = json.loads(result.stdout)
     except json.JSONDecodeError:
-        print("ERROR: could not parse vastai search offers output as JSON", file=sys.stderr)
+        print(
+            "ERROR: could not parse vastai search offers output as JSON",
+            file=sys.stderr,
+        )
         print(result.stdout, file=sys.stderr)
         sys.exit(1)
 
@@ -152,16 +160,25 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
     handoff".
     """
     if not REPO_GIT_URL:
-        print("WARNING: REPO_GIT_URL is not set. The onstart script will expect", file=sys.stderr)
-        print("the qwen3tts-finetune project to already be baked into the image, or", file=sys.stderr)
-        print("you must edit build_onstart_script() to fetch it another way (e.g. R2).", file=sys.stderr)
+        print(
+            "WARNING: REPO_GIT_URL is not set. The onstart script will expect",
+            file=sys.stderr,
+        )
+        print(
+            "the qwen3tts-finetune project to already be baked into the image, or",
+            file=sys.stderr,
+        )
+        print(
+            "you must edit build_onstart_script() to fetch it another way (e.g. R2).",
+            file=sys.stderr,
+        )
 
     if REPO_GIT_URL:
         clone_cmd = (
             f"for i in 1 2 3 4 5; do\n"
             f"  rm -rf repo\n"
             f"  if git clone --depth 1 {REPO_GIT_URL} repo; then break; fi\n"
-            f"  echo \"git clone attempt $i/5 failed, retrying in $((i*10))s ...\"\n"
+            f'  echo "git clone attempt $i/5 failed, retrying in $((i*10))s ..."\n'
             f"  sleep $((i*10))\n"
             f"done"
         )
@@ -190,10 +207,10 @@ cd /root
 REPO=/root/repo
 
 # --- env for R2 ---
-export R2_ACCOUNT_ID="{os.environ.get('R2_ACCOUNT_ID','')}"
-export R2_ACCESS_KEY_ID="{os.environ.get('R2_ACCESS_KEY_ID','')}"
-export R2_SECRET_ACCESS_KEY="{os.environ.get('R2_SECRET_ACCESS_KEY','')}"
-export R2_BUCKET="{os.environ.get('R2_BUCKET','')}"
+export R2_ACCOUNT_ID="{os.environ.get("R2_ACCOUNT_ID", "")}"
+export R2_ACCESS_KEY_ID="{os.environ.get("R2_ACCESS_KEY_ID", "")}"
+export R2_SECRET_ACCESS_KEY="{os.environ.get("R2_SECRET_ACCESS_KEY", "")}"
+export R2_BUCKET="{os.environ.get("R2_BUCKET", "")}"
 
 # --- HF_TOKEN (optional): huggingface_hub picks this up automatically for
 # snapshot_download/from_pretrained. Not required for the current public
@@ -201,7 +218,7 @@ export R2_BUCKET="{os.environ.get('R2_BUCKET','')}"
 # tighter rate limits / throttling -- a likely contributor to CDN stalls --
 # and (b) covers the model becoming gated later. Set HF_TOKEN locally before
 # running orchestrate.py to pass it through; harmless if empty. ---
-export HF_TOKEN="{os.environ.get('HF_TOKEN', os.environ.get('HUGGING_FACE_HUB_TOKEN', ''))}"
+export HF_TOKEN="{os.environ.get("HF_TOKEN", os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))}"
 
 # --- Complete handoff: install vastai CLI immediately so the cleanup trap
 # below can self-destruct the instance no matter where the pipeline fails.
@@ -490,17 +507,30 @@ mark_done SUCCESS
     return script
 
 
-def create_instance(offer_id, disk_gb, onstart_script_path,
-                     image="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime"):
+def create_instance(
+    offer_id,
+    disk_gb,
+    onstart_script_path,
+    image="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
+):
     """Create an instance with a single --disk GB container disk (no separate volume)."""
-    result = run([
-        "vastai", "create", "instance", str(offer_id),
-        "--image", image,
-        "--disk", str(disk_gb),
-        "--onstart", str(onstart_script_path),
-        "--ssh", "--direct",
-        "--raw",
-    ])
+    result = run(
+        [
+            "vastai",
+            "create",
+            "instance",
+            str(offer_id),
+            "--image",
+            image,
+            "--disk",
+            str(disk_gb),
+            "--onstart",
+            str(onstart_script_path),
+            "--ssh",
+            "--direct",
+            "--raw",
+        ]
+    )
     data = json.loads(result.stdout)
     if not data.get("success"):
         raise RuntimeError(f"create instance failed: {data}")
@@ -533,13 +563,21 @@ def download_r2_status():
     on the instance before it could upload anything."""
     tmp = Path("/tmp/r2_status_check.txt")
     _clear_tmp(tmp)
-    run([
-        "python3", str(Path(__file__).resolve().parent / "upload_to_r2.py"),
-        "--download",
-        "--bucket", os.environ["R2_BUCKET"],
-        "--key", f"{R2_PREFIX}/logs/status.txt",
-        "--file", str(tmp),
-    ], check=False, quiet=True)
+    run(
+        [
+            "python3",
+            str(Path(__file__).resolve().parent / "upload_to_r2.py"),
+            "--download",
+            "--bucket",
+            os.environ["R2_BUCKET"],
+            "--key",
+            f"{R2_PREFIX}/logs/status.txt",
+            "--file",
+            str(tmp),
+        ],
+        check=False,
+        quiet=True,
+    )
     if tmp.is_file():
         content = tmp.read_text().strip()
         _clear_tmp(tmp)
@@ -559,11 +597,16 @@ def check_done_marker(instance_id):
     """
     tmp = Path("/tmp/DONE_marker_check")
     _clear_tmp(tmp)
-    run([
-        "vastai", "copy",
-        f"{instance_id}:/root/DONE",
-        f"local:{tmp}",
-    ], check=False, quiet=True)
+    run(
+        [
+            "vastai",
+            "copy",
+            f"{instance_id}:/root/DONE",
+            f"local:{tmp}",
+        ],
+        check=False,
+        quiet=True,
+    )
     if tmp.is_file():
         content = tmp.read_text().strip()
         _clear_tmp(tmp)
@@ -586,44 +629,99 @@ def destroy_instance(instance_id):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-price", type=float, default=1.20, help="max $/hr for A100 PCIe")
-    ap.add_argument("--disk", type=int, default=250,
-                    help="container disk size in GB (default 250 -- see "
-                         "docs/RUNBOOK.md 'Disk budget' for the breakdown; "
-                         "steady-state ~144GB, peak transient ~160GB)")
-    ap.add_argument("--gpu", nargs="+", default=None,
-                    help="vast.ai gpu_name(s) to search, e.g. --gpu A100_PCIE A100_SXM4 "
-                         "(default: no filter, any GPU; cheapest matching offer across "
-                         "all given wins)")
-    ap.add_argument("--min-vram", type=int, default=None, metavar="GB",
-                    help="minimum GPU VRAM in GB (e.g. 80 to require the 80GB A100 "
-                         "variant, excluding 40GB offers)")
-    ap.add_argument("--min-reliability", type=float, default=0.95,
-                    help="minimum vast.ai reliability score, 0-1 (default 0.95)")
-    ap.add_argument("--poll-interval", type=int, default=300,
-                    help="seconds between status checks (default 300 for long runs)")
-    ap.add_argument("--timeout-hours", type=float, default=30.0,
-                    help="safety net, not expected runtime (default 30)")
-    ap.add_argument("--slr104-pairs", nargs="+", default=["hindi-english", "bengali-english"],
-                    choices=["hindi-english", "bengali-english"],
-                    help="OpenSLR-104 code-switched pairs to download")
-    ap.add_argument("--slr104-include-test", action="store_true",
-                    help="also download the (smaller) OpenSLR-104 test splits")
-    ap.add_argument("--eval-frac", type=float, default=0.02,
-                    help="fraction of combined dataset held out for eval")
-    ap.add_argument("--resume", action="store_true",
-                    help="resume a previously failed run: each pipeline stage checks R2 "
-                         "for that stage's output first and downloads it instead of "
-                         "recomputing if present (see docs/RUNBOOK.md 'Resuming a failed run')")
-    ap.add_argument("--dry-run", action="store_true", help="search and show offer only, don't create")
-    ap.add_argument("--attach", type=int, default=None, metavar="INSTANCE_ID",
-                    help="re-attach polling to an already-running instance instead of "
-                         "creating a new one -- use this after Ctrl-C'ing a previous run "
-                         "(Ctrl-C only stops local polling; the remote pipeline and its "
-                         "self-destruct trap keep running independently)")
+    ap.add_argument(
+        "--max-price", type=float, default=1.20, help="max $/hr for A100 PCIe"
+    )
+    ap.add_argument(
+        "--disk",
+        type=int,
+        default=250,
+        help="container disk size in GB (default 250 -- see "
+        "docs/RUNBOOK.md 'Disk budget' for the breakdown; "
+        "steady-state ~144GB, peak transient ~160GB)",
+    )
+    ap.add_argument(
+        "--gpu",
+        nargs="+",
+        default=None,
+        help="vast.ai gpu_name(s) to search, e.g. --gpu A100_PCIE A100_SXM4 "
+        "(default: no filter, any GPU; cheapest matching offer across "
+        "all given wins)",
+    )
+    ap.add_argument(
+        "--min-vram",
+        type=int,
+        default=None,
+        metavar="GB",
+        help="minimum GPU VRAM in GB (e.g. 80 to require the 80GB A100 "
+        "variant, excluding 40GB offers)",
+    )
+    ap.add_argument(
+        "--min-reliability",
+        type=float,
+        default=0.95,
+        help="minimum vast.ai reliability score, 0-1 (default 0.95)",
+    )
+    ap.add_argument(
+        "--poll-interval",
+        type=int,
+        default=300,
+        help="seconds between status checks (default 300 for long runs)",
+    )
+    ap.add_argument(
+        "--timeout-hours",
+        type=float,
+        default=30.0,
+        help="safety net, not expected runtime (default 30)",
+    )
+    ap.add_argument(
+        "--slr104-pairs",
+        nargs="+",
+        default=["hindi-english", "bengali-english"],
+        choices=["hindi-english", "bengali-english"],
+        help="OpenSLR-104 code-switched pairs to download",
+    )
+    ap.add_argument(
+        "--slr104-include-test",
+        action="store_true",
+        help="also download the (smaller) OpenSLR-104 test splits",
+    )
+    ap.add_argument(
+        "--eval-frac",
+        type=float,
+        default=0.02,
+        help="fraction of combined dataset held out for eval",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume a previously failed run: each pipeline stage checks R2 "
+        "for that stage's output first and downloads it instead of "
+        "recomputing if present (see docs/RUNBOOK.md 'Resuming a failed run')",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="search and show offer only, don't create",
+    )
+    ap.add_argument(
+        "--attach",
+        type=int,
+        default=None,
+        metavar="INSTANCE_ID",
+        help="re-attach polling to an already-running instance instead of "
+        "creating a new one -- use this after Ctrl-C'ing a previous run "
+        "(Ctrl-C only stops local polling; the remote pipeline and its "
+        "self-destruct trap keep running independently)",
+    )
     args = ap.parse_args()
 
-    for var in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"):
+    for var in (
+        "R2_ACCOUNT_ID",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_BUCKET",
+    ):
         if not os.environ.get(var):
             print(f"ERROR: {var} not set", file=sys.stderr)
             sys.exit(1)
@@ -634,23 +732,34 @@ def main():
 
     if args.attach is not None:
         instance_id = args.attach
-        print(f"Re-attaching to instance {instance_id} -- skipping offer search/creation.")
+        print(
+            f"Re-attaching to instance {instance_id} -- skipping offer search/creation."
+        )
         print("Polling for completion ...")
     else:
-        gpu_msg = '/'.join(args.gpu) if args.gpu else "any GPU"
+        gpu_msg = "/".join(args.gpu) if args.gpu else "any GPU"
         vram_msg = f", >= {args.min_vram}GB VRAM" if args.min_vram else ""
-        print(f"Searching for {gpu_msg} offers under ${args.max_price}/hr "
-              f"with >= {args.disk}GB disk{vram_msg}, "
-              f"reliability > {args.min_reliability} ...")
-        offers = search_offers(args.max_price, args.disk, gpu=args.gpu,
-                                min_reliability=args.min_reliability, min_vram_gb=args.min_vram)
+        print(
+            f"Searching for {gpu_msg} offers under ${args.max_price}/hr "
+            f"with >= {args.disk}GB disk{vram_msg}, "
+            f"reliability > {args.min_reliability} ..."
+        )
+        offers = search_offers(
+            args.max_price,
+            args.disk,
+            gpu=args.gpu,
+            min_reliability=args.min_reliability,
+            min_vram_gb=args.min_vram,
+        )
         best = offers[0]
         print(f"\\nTop {min(5, len(offers))} offers:")
         for o in offers[:5]:
-            print(f"  id={o['id']} ${o['dph_total']:.3f}/hr "
-                  f"reliability={o.get('reliability', 0):.3f} "
-                  f"disk={o.get('disk_space')}GB "
-                  f"loc={o.get('geolocation','?')}")
+            print(
+                f"  id={o['id']} ${o['dph_total']:.3f}/hr "
+                f"reliability={o.get('reliability', 0):.3f} "
+                f"disk={o.get('disk_space')}GB "
+                f"loc={o.get('geolocation', '?')}"
+            )
 
         print(f"\\nSelected offer id={best['id']} at ${best['dph_total']:.3f}/hr")
 
@@ -659,15 +768,19 @@ def main():
             return
 
         onstart_path = Path("/tmp/onstart.sh")
-        onstart_path.write_text(build_onstart_script(
-            slr104_pairs=args.slr104_pairs,
-            slr104_include_test=args.slr104_include_test,
-            eval_frac=args.eval_frac,
-            resume=args.resume,
-        ))
+        onstart_path.write_text(
+            build_onstart_script(
+                slr104_pairs=args.slr104_pairs,
+                slr104_include_test=args.slr104_include_test,
+                eval_frac=args.eval_frac,
+                resume=args.resume,
+            )
+        )
         print(f"\\nGenerated onstart script -> {onstart_path}")
         if args.resume:
-            print("--resume set: each stage will check R2 for prior outputs before recomputing.")
+            print(
+                "--resume set: each stage will check R2 for prior outputs before recomputing."
+            )
 
         print("\\nCreating instance ...")
 
@@ -681,9 +794,13 @@ def main():
                 print(f"Attaching SSH key from {ssh_pubkey_path} ...")
                 attach_ssh_key(instance_id, ssh_pubkey_path)
                 run(["vastai", "ssh-url", str(instance_id)], check=False)
-                print("(use the URL above to SSH in manually and inspect /root/pipeline.log)")
+                print(
+                    "(use the URL above to SSH in manually and inspect /root/pipeline.log)"
+                )
             else:
-                print("VAST_SSH_PUBKEY_PATH not set -- skipping manual SSH access setup.")
+                print(
+                    "VAST_SSH_PUBKEY_PATH not set -- skipping manual SSH access setup."
+                )
             print("Pipeline is now running in the background via onstart script.")
             print("Polling for completion ...")
 
@@ -701,7 +818,7 @@ def main():
 
             info = get_instance_status(instance_id)
             actual_status = info.get("actual_status") if info else None
-            print(f"  [{elapsed/60:.1f}min] instance status: {actual_status}")
+            print(f"  [{elapsed / 60:.1f}min] instance status: {actual_status}")
 
             if not info:
                 # The instance may already be gone -- its cleanup trap
@@ -710,7 +827,9 @@ def main():
                 # for the status it uploads just before destroying itself.
                 r2_status = download_r2_status()
                 if r2_status:
-                    print(f"\\nInstance is gone; self-reported status from R2: {r2_status}")
+                    print(
+                        f"\\nInstance is gone; self-reported status from R2: {r2_status}"
+                    )
                     final_status = r2_status
                     self_destructed = True
                     break
@@ -739,7 +858,9 @@ def main():
         # instance here, or the whole point of "fire and forget" is lost.
         print("\\n\\nInterrupted (Ctrl-C) -- this only stops local polling.")
         print("The remote pipeline keeps running and will self-destruct on its own")
-        print("(success or failure) via its cleanup trap. The instance is NOT being destroyed.")
+        print(
+            "(success or failure) via its cleanup trap. The instance is NOT being destroyed."
+        )
         if instance_id is not None:
             print(f"\\nRe-attach polling later with:")
             print(f"  python3 {sys.argv[0]} --attach {instance_id}")
@@ -755,21 +876,42 @@ def main():
     print(f"\\nFinal status: {final_status}")
 
     if final_status == "SUCCESS":
-        print(f"Results uploaded to R2 under {R2_PREFIX}/ "
-              f"(final_fp32/, final_bf16/, final_fp16/, manifest/codes backups, logs/)")
+        print(
+            f"Results uploaded to R2 under {R2_PREFIX}/ "
+            f"(final_fp32/, final_bf16/, final_fp16/, manifest/codes backups, logs/)"
+        )
     elif final_status not in (None, "SUCCESS"):
         print("Pipeline did not succeed. Pulling log for debugging ...")
         if self_destructed or instance_id is None:
-            run([
-                "python3", str(Path(__file__).resolve().parent / "upload_to_r2.py"),
-                "--download", "--bucket", os.environ["R2_BUCKET"],
-                "--key", f"{R2_PREFIX}/logs/pipeline.log", "--file", "./pipeline_failed.log",
-            ], check=False)
+            run(
+                [
+                    "python3",
+                    str(Path(__file__).resolve().parent / "upload_to_r2.py"),
+                    "--download",
+                    "--bucket",
+                    os.environ["R2_BUCKET"],
+                    "--key",
+                    f"{R2_PREFIX}/logs/pipeline.log",
+                    "--file",
+                    "./pipeline_failed.log",
+                ],
+                check=False,
+            )
         else:
-            run(["vastai", "copy", f"{instance_id}:/root/pipeline.log", "local:./pipeline_failed.log"], check=False)
+            run(
+                [
+                    "vastai",
+                    "copy",
+                    f"{instance_id}:/root/pipeline.log",
+                    "local:./pipeline_failed.log",
+                ],
+                check=False,
+            )
         print("Saved to ./pipeline_failed.log (if found) -- inspect before retrying.")
-        print(f"Full status + per-failure log copies are also under "
-              f"{R2_PREFIX}/logs/ in R2 (status.txt, pipeline_failed_<status>_<ts>.log).")
+        print(
+            f"Full status + per-failure log copies are also under "
+            f"{R2_PREFIX}/logs/ in R2 (status.txt, pipeline_failed_<status>_<ts>.log)."
+        )
 
     if instance_id is not None:
         # Idempotent backstop: the instance's own cleanup trap already
@@ -779,7 +921,9 @@ def main():
         # the remaining cases where the orchestrator itself decides to give up
         # (--timeout-hours, INSTANCE_EXITED/OFFLINE, provisioning error). Note:
         # Ctrl-C (KeyboardInterrupt) returns earlier above and never reaches here.
-        print(f"\\nDestroying instance {instance_id} (if not already self-destructed) ...")
+        print(
+            f"\\nDestroying instance {instance_id} (if not already self-destructed) ..."
+        )
         destroy_instance(instance_id)
         print("Done. Billing stopped, container disk destroyed with the instance.")
     else:
