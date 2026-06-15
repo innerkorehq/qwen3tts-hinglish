@@ -21,7 +21,7 @@ end-to-end on `/root/work` (the instance's container disk):
 ```
 download HiACC + OpenSLR-104 (Hindi-English, Bengali-English)
   -> build unified manifest (resample to 24kHz mono, filter, train/eval split)
-  -> backup raw manifests + resampled audio to R2
+  -> backup raw manifests + resampled audio (as a single resampled.tar) to R2
   -> free disk: remove raw sliced audio now that resampled/ exists
   -> encode audio -> discrete codes (Qwen3-TTS-Tokenizer-12Hz, on GPU)
   -> backup encoded codes to R2
@@ -450,11 +450,11 @@ issue above before committing to the full Hindi-English + Bengali-English run.
 | `final_gguf` | `final_gguf/` (if present) | Attempted llama.cpp GGUF conversion — see caveat below. |
 
 Raw manifests, resampled audio, and encoded codes are also backed up to R2
-(`manifest_raw.jsonl`, `manifest_eval_raw.jsonl`, `resampled/`,
+(`manifest_raw.jsonl`, `manifest_eval_raw.jsonl`, `resampled.tar`,
 `train_with_codes.jsonl`, `eval_with_codes.jsonl`) — a failed run after the
-manifest/encode stage doesn't strictly require re-downloading or re-resampling on a
-fresh rental, though `orchestrate.py` doesn't currently check for or reuse these on
-a fresh run (see Known gaps).
+manifest/encode stage doesn't require re-downloading or re-resampling on a
+fresh rental: `orchestrate.py --resume` downloads and reuses these (see
+"Resuming a failed run").
 
 ### GGUF caveat
 
@@ -587,23 +587,30 @@ after each epoch, `--max-steps` for dry-run timing.
 failed run) makes each pipeline stage check R2 for a prior run's output before
 recomputing it:
 
-- **Download + manifest**: downloads `manifest_raw.jsonl`/`manifest_eval_raw.jsonl`
-  from R2 (if present) and compares their combined record count against the
-  number of objects under `resampled/` in R2:
-  - If `resampled/` has **at least as many objects as the manifests reference**,
-    it's treated as complete — downloads it and skips HiACC/OpenSLR-104
-    entirely (the large, slow downloads).
-  - If `resampled/` is **incomplete** (e.g. an earlier run was interrupted
-    mid-upload), downloads that partial set anyway, then re-downloads
-    HiACC/OpenSLR-104 and reruns `build_manifest.py`. `build_manifest.py` is
-    itself per-file resumable: for each expected output file, if it already
-    exists (non-empty) under `--resampled-dir`, it reuses it (reading the
-    duration from the file header) instead of re-decoding/re-resampling —
-    only the missing files are actually resampled.
-  - A plain `--exists --recursive` check (`MaxKeys=1`) can't tell a partial
-    upload from a complete one, which is why this uses
-    `upload_to_r2.py --count --recursive` (counts all objects under a prefix)
-    instead.
+- **Download + manifest**: checks whether `resampled.tar` exists in R2 and
+  `manifest_raw.jsonl`/`manifest_eval_raw.jsonl` can be downloaded:
+  - If all three are present, downloads `resampled.tar` and extracts it to
+    `./data/resampled/`, skipping HiACC/OpenSLR-104 and `build_manifest.py`
+    entirely (the large, slow steps).
+  - If `resampled.tar` is missing but the manifests download successfully
+    (e.g. a run from before this tar scheme existed), downloads whatever
+    individual `resampled/*` objects exist in R2 (best-effort) for
+    `build_manifest.py` to reuse via its per-file resumability (for each
+    expected output file, if it already exists non-empty under
+    `--resampled-dir`, it reuses it -- reading the duration from the file
+    header -- instead of re-decoding/re-resampling), then re-downloads
+    HiACC/OpenSLR-104 and reruns `build_manifest.py`, resampling only what's
+    missing.
+  - If neither the manifests nor `resampled.tar` are present, runs the full
+    download + `build_manifest.py` pipeline from scratch.
+  - In either non-tar case, once `build_manifest.py` finishes, `resampled/` is
+    tarred into a single `resampled.tar` and uploaded as one object (not
+    individual files) — tens of thousands of small files would otherwise mean
+    tens of thousands of slow R2 requests on both upload and download. A plain
+    object existence check is unambiguous for a single tar (no partial-upload
+    ambiguity like individual files had), so no count-based completeness check
+    is needed. Any individual `resampled/*` objects left in R2 from an older
+    run are deleted once `resampled.tar` uploads successfully.
 - **Encode**: if `train_with_codes.jsonl` and `eval_with_codes.jsonl` exist in
   R2, downloads them instead of re-running `encode_codes.py`.
 - **Train**: if `accel_state/` and `training_state.json` exist in R2, downloads

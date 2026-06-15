@@ -259,39 +259,48 @@ bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 
 
 # --- 2/3. download datasets + build unified manifest (resample to 24kHz mono,
 #          filter, train/eval split) -- or, with --resume, reuse a prior run's
-#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled from R2 ---
+#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled.tar (or, for
+#          older runs, individual resampled/ files) from R2 ---
 #
-# Upfront completeness check (before downloading HiACC/OpenSLR-104, which are
-# large and slow): a bare `--exists --recursive` only checks for *any* object
-# under resampled/ (MaxKeys=1), so a partially-uploaded resampled/ from an
-# interrupted earlier run would look "complete" and the whole rebuild would be
-# skipped -- leaving most resampled files missing for encode_codes.py later.
-# Instead, compare the object count under resampled/ against the record count
-# across both manifests.
-RESUME_MANIFEST=0
+# resampled/ contains tens of thousands of small files -- uploading/downloading
+# them individually is slow and racks up R2 API requests. Once build_manifest.py
+# finishes, tar the whole resampled/ dir into a single resampled.tar and upload
+# that one object; resume then only has to check for and download a single
+# object (cheap, unambiguous: it either exists complete or doesn't exist at all
+# -- no partial-upload ambiguity like individual files had). A run from before
+# this scheme existed may still have individual resampled/* objects in R2 and
+# no resampled.tar -- fall back to downloading those for build_manifest.py's
+# per-file resumability.
+RESUME_TAR=0
+RESUME_FILES=0
 if [ "{RESUME}" = "1" ]; then
-  if python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled.tar \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
        --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
      && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
        --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
-    EXPECTED=$(cat ./data/manifest_raw.jsonl ./data/manifest_eval_raw.jsonl | wc -l)
-    ACTUAL=$(python3 "$REPO/scripts/upload_to_r2.py" --count --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled)
-    echo "--resume: manifests reference $EXPECTED resampled files; R2 resampled/ has $ACTUAL"
-    if [ "$EXPECTED" -gt "0" ] && [ "$ACTUAL" -ge "$EXPECTED" ]; then
-      RESUME_MANIFEST=1
-    fi
+    RESUME_TAR=1
+  elif python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+    RESUME_FILES=1
   fi
 fi
 
-if [ "$RESUME_MANIFEST" = "1" ]; then
-  echo "--resume: resampled audio in R2 is complete, downloading instead of rebuilding"
-  python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled --file ./data/resampled \\
+if [ "$RESUME_TAR" = "1" ]; then
+  echo "--resume: found resampled.tar in R2, downloading and extracting instead of rebuilding"
+  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled.tar --file ./data/resampled.tar \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  mkdir -p ./data/resampled
+  tar -xf ./data/resampled.tar -C ./data \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  rm -f ./data/resampled.tar
 else
-  if [ "{RESUME}" = "1" ] && [ -f ./data/manifest_raw.jsonl ]; then
-    echo "--resume: resampled audio in R2 is incomplete -- downloading the partial set"
-    echo "  (build_manifest.py will reuse those files and only resample what's missing)"
+  if [ "$RESUME_FILES" = "1" ]; then
+    echo "--resume: no resampled.tar in R2 -- downloading individual resampled/ files"
+    echo "  from an older run (if any) for build_manifest.py to reuse"
     python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/resampled --file ./data/resampled || true
   fi
@@ -321,18 +330,31 @@ else
 
   # Backup raw manifests + resampled audio to R2 (important intermediary artifacts --
   # if encoding or training fails later, you don't have to re-download/re-resample
-  # on a fresh rental)
+  # on a fresh rental). resampled/ goes up as a single tar (see comment above).
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_raw.jsonl
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_eval_raw.jsonl
-  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/resampled --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled --recursive
 
   # Free up disk: raw sliced audio (16kHz, from download_slr104.py / download_hiacc.py)
-  # is no longer needed once resampled/ exists. This matters at our disk budget --
-  # see docs/RUNBOOK.md "Disk budget".
+  # is no longer needed once resampled/ exists. Do this *before* tarring
+  # resampled/ below -- the tar is a same-size duplicate of resampled/ while
+  # it exists on disk, so removing raw audio first keeps that transient bounded.
+  # This matters at our disk budget -- see docs/RUNBOOK.md "Disk budget".
   rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
+
+  tar -cf ./data/resampled.tar -C ./data resampled \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/resampled.tar --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled.tar \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  rm -f ./data/resampled.tar
+
+  # Clean up any individual resampled/ objects left over in R2 from a previous
+  # run that used the old per-file upload scheme -- resampled.tar above is now
+  # the single source of truth.
+  python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled || true
 fi
 
 # --- 4. encode audio -> codes -- or, with --resume, reuse a prior run's

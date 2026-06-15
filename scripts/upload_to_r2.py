@@ -193,6 +193,23 @@ def prefix_exists(client, bucket, key_prefix):
     return resp.get("KeyCount", 0) > 0
 
 
+def delete_prefix(client, bucket, key_prefix):
+    """Delete all objects under key_prefix/ (best-effort, used to clean up
+    objects uploaded under a now-superseded scheme, e.g. the individual
+    per-file resampled/ objects after resampled.tar replaces them)."""
+    prefix = key_prefix.rstrip("/") + "/"
+    paginator = client.get_paginator("list_objects_v2")
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if not keys:
+            continue
+        retry(client.delete_objects, Bucket=bucket, Delete={"Objects": keys},
+              what=f"delete {len(keys)} objects under {prefix}")
+        deleted += len(keys)
+    return deleted
+
+
 def count_prefix(client, bucket, key_prefix):
     """Count objects under key_prefix/ (excluding the directory-marker object
     itself, if any) -- used for resume completeness checks where a single
@@ -223,6 +240,9 @@ def main():
                          "--recursive) -- for resume completeness checks, where "
                          "--exists (MaxKeys=1) can't tell a partial upload from a "
                          "complete one; no --file needed")
+    ap.add_argument("--delete", action="store_true",
+                    help="delete all objects under --key prefix (requires --recursive); "
+                         "best-effort cleanup, no --file needed")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"parallel transfers for --recursive (default {DEFAULT_CONCURRENCY})")
     args = ap.parse_args()
@@ -236,6 +256,14 @@ def main():
 
     if args.count:
         print(count_prefix(client, args.bucket, args.key))
+        return
+
+    if args.delete:
+        if not args.recursive:
+            print("ERROR: --delete requires --recursive", file=sys.stderr)
+            sys.exit(1)
+        deleted = delete_prefix(client, args.bucket, args.key)
+        print(f"Deleted {deleted} objects under s3://{args.bucket}/{args.key.rstrip('/')}/")
         return
 
     if args.exists:
