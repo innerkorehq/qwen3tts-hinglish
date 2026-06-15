@@ -257,23 +257,10 @@ fi
 # --- 1. bootstrap deps (GPU/disk checks, Python deps, sox, flash-attn) ---
 bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 1; }}
 
-# --- 2/3. download datasets + build unified manifest (resample to 24kHz mono,
-#          filter, train/eval split) -- or, with --resume, reuse a prior run's
-#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled_shards/ (or,
-#          for older runs, a single resampled.tar or individual resampled/
-#          files) from R2 ---
-#
-# resampled/ contains tens of thousands of small files -- uploading/downloading
-# them individually is slow and racks up R2 API requests. Once build_manifest.py
-# finishes, shard_tar.py packs resampled/ into ~1GB tar shards
-# (resampled_shards/shard_NNNNN.tar) plus a manifest.json (uploaded last, once
-# every shard has succeeded). Resume checks for the manifest: if present,
-# downloads+extracts each shard. Sharding (vs one big tar) bounds both the
-# disk overhead (one ~1GB shard alongside resampled/ at a time, not a
-# full-size duplicate) and how much a flaky connection can waste on a reset
-# (one shard, not the whole archive). Runs from before this scheme existed may
-# have a single resampled.tar, or (older still) individual resampled/* objects
-# -- fall back accordingly.
+# --- 2/3. download datasets + build unified manifest -- or, with --resume,
+#          reuse a prior run's manifest + resampled_shards/ (or older
+#          resampled.tar / resampled/* schemes) from R2. See RUNBOOK.md
+#          "Resuming a failed run" for the sharding rationale. ---
 RESUME_SHARDS=0
 RESUME_TAR=0
 RESUME_FILES=0
@@ -338,25 +325,18 @@ else
     --eval-frac {EVAL_FRAC} \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
 
-  # build_manifest.py writes the eval split as manifest_eval_raw.jsonl alongside
-  # the requested --out path (same stem with _eval_raw suffix)
+  # manifest_eval_raw.jsonl is written alongside --out (same stem + _eval_raw)
   if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
     mark_done FAILED_BUILD_MANIFEST; exit 1
   fi
 
-  # Backup raw manifests + resampled audio to R2 (important intermediary artifacts --
-  # if encoding or training fails later, you don't have to re-download/re-resample
-  # on a fresh rental). resampled/ goes up as ~1GB tar shards (see comment above).
+  # Backup raw manifests + resampled audio to R2 as ~1GB tar shards.
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_raw.jsonl
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_eval_raw.jsonl
 
-  # Free up disk: raw sliced audio (16kHz, from download_slr104.py / download_hiacc.py)
-  # is no longer needed once resampled/ exists. Do this *before* sharding
-  # resampled/ below -- each shard is a transient ~1GB duplicate of part of
-  # resampled/ while it exists on disk, so removing raw audio first keeps that
-  # bounded. This matters at our disk budget -- see docs/RUNBOOK.md "Disk budget".
+  # Free disk before sharding -- see RUNBOOK.md "Disk budget".
   rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
 
   python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
@@ -364,8 +344,7 @@ else
     --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
 
-  # Clean up objects left over in R2 from previous schemes -- resampled_shards/
-  # above is now the single source of truth.
+  # Clean up objects from older schemes -- resampled_shards/ is now canonical.
   python3 "$REPO/scripts/upload_to_r2.py" --delete --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/resampled.tar || true
   python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
