@@ -292,6 +292,17 @@ def main():
     if args.resume and accel_state_dir.exists() and state_path.exists():
         accelerator.print(f"Resuming from {accel_state_dir} ...")
         accelerator.load_state(str(accel_state_dir))
+
+        # load_state() restores the optimizer's param_groups (lr, initial_lr)
+        # and the scheduler's base_lrs from the saved run's lr -- so a changed
+        # training.lr in the config would otherwise be silently ignored on
+        # resume. Re-apply the current config's lr now.
+        for group in optimizer.param_groups:
+            group["lr"] = t["lr"]
+            group["initial_lr"] = t["lr"]
+        lr_scheduler.base_lrs = [t["lr"] for _ in lr_scheduler.base_lrs]
+        accelerator.print(f"  re-applied lr={t['lr']:.2e} from config (overriding resumed optimizer/scheduler state)")
+
         with open(state_path) as f:
             saved = json.load(f)
         start_epoch = saved["epoch"] + 1

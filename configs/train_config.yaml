@@ -34,12 +34,16 @@ data:
 
 training:
   # --- Epochs ---
-  # Reduced from 3 -> 2. With ~63k clips and 1.7B params, the tokens-to-params
-  # ratio is only ~0.1x per epoch -- 3 epochs almost certainly overfits.
-  # 2 epochs is aggressive but manageable with the per-epoch eval loop below.
-  # If eval loss is still decreasing at epoch 2, consider a follow-up run with
-  # num_epochs: 3 (use --resume to continue from the saved checkpoint).
-  num_epochs: 2
+  # The first run (2 epochs) finished with eval_loss 5.3175 -- still far from
+  # converged (random-guess cross-entropy over the 3072-way codec vocab is
+  # ~8.0), and inference output was garbled/way too long (model not predicting
+  # the codec EOS token at the right time). Extending to 6 epochs total.
+  # Run with --resume: train.py picks up at epoch 2 (0-indexed) from the saved
+  # accel_state/training_state.json, so this adds 4 more epochs on top of the
+  # first run rather than restarting. The cosine LR schedule is recomputed for
+  # the new total_epochs and "reheats" from where the previous run's schedule
+  # ended, decaying to 0 by the new final epoch.
+  num_epochs: 6
 
   # --- Batch size ---
   # effective = batch_size x gradient_accumulation_steps = 4 x 8 = 32
@@ -48,12 +52,17 @@ training:
   gradient_accumulation_steps: 8
 
   # --- Learning rate ---
-  # 1e-5 is conservative for full FT of 1.7B but appropriate given the small
-  # dataset-to-model ratio. Higher (2e-5) risks faster overfitting; lower
-  # (5e-6) may underfit in only 2 epochs. Start here, check the loss curve.
-  lr: 1.0e-5
+  # 1e-5 over 2 epochs left eval_loss at 5.3175 -- far from converged (random
+  # guess over the 3072-way codec vocab is ~8.0) and inference output was
+  # garbled. Bumping to 2e-5 for the remaining 4 epochs (6 total, via
+  # --resume) to converge faster. train.py re-applies this lr on resume
+  # (overriding the resumed optimizer/scheduler state, which was saved at
+  # 1e-5) and the cosine schedule recomputed for num_epochs=6 reheats from
+  # ~0 back to ~0.8x this lr at the current step, then decays to 0 over the
+  # remaining epochs.
+  lr: 2.0e-5
   lr_scheduler_type: cosine
-  warmup_ratio: 0.05            # ~199 steps warmup
+  warmup_ratio: 0.05            # ~595 steps warmup (of ~11,910 total over 6 epochs)
 
   # --- Regularization ---
   weight_decay: 0.01
