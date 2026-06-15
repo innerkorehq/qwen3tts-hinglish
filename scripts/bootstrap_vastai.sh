@@ -59,10 +59,38 @@ echo "=== 3b/3: Installing flash-attn (optional, faster attention) ==="
 # manual PyTorch attention path (slower, but already works).
 pip_retry ninja packaging
 export MAX_JOBS=4
-if timeout 1800 pip install -q flash-attn --no-build-isolation; then
-  echo "flash-attn installed"
+
+# flash-attn's setup.py needs CUDA_HOME (nvcc + headers) via
+# torch.utils.cpp_extension, which many PyTorch docker images don't set even
+# though the CUDA runtime itself is present. Try, in order: an existing nvcc
+# on PATH, /usr/local/cuda, then a pip-only nvcc matching torch's CUDA build
+# (nvidia-cuda-nvcc-cu12, ~tens of MB).
+if [ -z "${CUDA_HOME:-}" ]; then
+  if command -v nvcc >/dev/null 2>&1; then
+    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+  elif [ -d /usr/local/cuda ]; then
+    export CUDA_HOME=/usr/local/cuda
+  else
+    pip_retry nvidia-cuda-nvcc-cu12 || true
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+    NVCC_PATH=$(find "$SITE_PACKAGES/nvidia" -maxdepth 4 -type f -name nvcc 2>/dev/null | head -1)
+    if [ -n "$NVCC_PATH" ]; then
+      export CUDA_HOME="$(dirname "$(dirname "$NVCC_PATH")")"
+      export PATH="$CUDA_HOME/bin:$PATH"
+    fi
+  fi
+fi
+
+if [ -n "${CUDA_HOME:-}" ]; then
+  echo "CUDA_HOME=$CUDA_HOME"
+  if timeout 1800 pip install -q flash-attn --no-build-isolation; then
+    echo "flash-attn installed"
+  else
+    echo "WARNING: flash-attn install failed or timed out -- continuing without it (slower attention, non-fatal)"
+  fi
 else
-  echo "WARNING: flash-attn install failed or timed out -- continuing without it (slower attention, non-fatal)"
+  echo "WARNING: no CUDA toolkit (nvcc) found, even via pip fallback -- skipping flash-attn build."
+  echo "  Continuing without it (slower attention, non-fatal)."
 fi
 
 mkdir -p ./data ./models
