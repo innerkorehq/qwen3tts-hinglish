@@ -14,15 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Vendored verbatim from
+# Vendored from
 # https://github.com/QwenLM/Qwen3-TTS/blob/main/finetuning/dataset.py
 # (not part of the `qwen-tts` pip package; `train.py` depends on it directly
 # for the official TTSDataset/collate_fn used by the finetuning loop).
+#
+# Deviation from upstream: collate_fn's `torch.cat(ref_mels, dim=0)` assumes
+# every sample's ref_mel has the same time length, which holds for upstream's
+# single-global-ref-audio design but not ours (per-sample `ref_audio`, clip
+# durations vary 1-30s per build_manifest.py's MIN_DUR/MAX_DUR). Pad ref_mels
+# to the batch max length before concatenating -- see collate_fn below.
 from typing import Any, List, Tuple, Union
 
 import librosa
 import numpy as np
 import torch
+import torch.nn.functional as F
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 from torch.utils.data import Dataset
@@ -209,6 +216,16 @@ class TTSDataset(Dataset):
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
 
         ref_mels = [data['ref_mel'] for data in batch]
+        # Pad to the batch's max mel length before concatenating (see header
+        # comment) -- pad value matches dynamic_range_compression_torch's
+        # clamp floor (log(1e-5)), i.e. "silence" in log-mel space, rather
+        # than 0 which would read as comparatively loud.
+        max_mel_len = max(m.shape[1] for m in ref_mels)
+        mel_pad_value = float(np.log(1e-5))
+        ref_mels = [
+            F.pad(m, (0, 0, 0, max_mel_len - m.shape[1]), value=mel_pad_value)
+            for m in ref_mels
+        ]
         ref_mels = torch.cat(ref_mels,dim=0)
 
         return {
