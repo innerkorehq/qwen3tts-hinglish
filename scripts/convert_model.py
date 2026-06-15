@@ -55,10 +55,12 @@ def convert_dtype(master_dir: Path, out_dir: Path, dtype_name: str):
     target_dtype = dtype_map[dtype_name]
 
     print(f"Loading fp32 master from {master_dir} ...")
-    model = Qwen3TTSModel.from_pretrained(master_dir, torch_dtype=torch.float32)
+    wrapper = Qwen3TTSModel.from_pretrained(master_dir, torch_dtype=torch.float32)
 
     print(f"Casting to {dtype_name} and saving to {out_dir} ...")
-    save_checkpoint(model, master_dir, out_dir, dtype=target_dtype)
+    # Qwen3TTSModel is an inference wrapper, not an nn.Module -- the actual
+    # model (with .state_dict()) that save_checkpoint() expects is .model.
+    save_checkpoint(wrapper.model, master_dir, out_dir, dtype=target_dtype)
 
     print(f"Done. {dtype_name} model at {out_dir}")
     if dtype_name == "fp16":
