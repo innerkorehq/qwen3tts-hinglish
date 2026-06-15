@@ -37,7 +37,7 @@ pip_retry() {
   done
 }
 pip_retry -U pip
-pip_retry qwen-tts transformers accelerate deepspeed boto3 soundfile librosa \
+pip_retry qwen-tts transformers accelerate boto3 soundfile librosa \
   datasets huggingface_hub pydub requests pyyaml
 
 echo "=== 3a/3: Installing sox ==="

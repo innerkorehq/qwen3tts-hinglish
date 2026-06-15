@@ -41,6 +41,20 @@ from qwen_tts_dataset import TTSDataset
 R2_PREFIX = "finetune/qwen3tts-hinglish"
 
 
+def unwrap_model(model):
+    """Like accelerator.unwrap_model(), but without it: accelerate's
+    extract_model_from_parallel() unconditionally does `from deepspeed import
+    DeepSpeedEngine` when deepspeed is importable, and deepspeed's import
+    crashes with MissingCUDAException on images that have torch+CUDA runtime
+    but no CUDA_HOME/nvcc (e.g. pytorch/pytorch:*-runtime) -- even though we
+    never use deepspeed. Single-process accelerate only ever wraps in
+    DistributedDataParallel (or not at all), so unwrapping `.module` is
+    sufficient here."""
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
 def _r2_client_and_bucket():
     """Return (client, bucket) if R2 env vars are set, else (None, None)."""
     import os
@@ -327,7 +341,7 @@ def main():
 
         # --- checkpoint / resume state (main process only) ---
         if accelerator.is_main_process:
-            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model = unwrap_model(model)
 
             if eval_loss is not None and eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
@@ -359,7 +373,7 @@ def main():
 
     # --- final outputs ---
     if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model = unwrap_model(model)
 
         master_dir = output_dir / "final_fp32"
         print(f"Saving fp32 master to {master_dir} ...")

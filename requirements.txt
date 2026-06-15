@@ -10,4 +10,3 @@ boto3
 pydub
 pyyaml
 requests
-deepspeed   # GPU-only, harmless if unused
