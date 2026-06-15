@@ -259,22 +259,32 @@ bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 
 
 # --- 2/3. download datasets + build unified manifest (resample to 24kHz mono,
 #          filter, train/eval split) -- or, with --resume, reuse a prior run's
-#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled.tar (or, for
-#          older runs, individual resampled/ files) from R2 ---
+#          manifest_raw.jsonl/manifest_eval_raw.jsonl/resampled_shards/ (or,
+#          for older runs, a single resampled.tar or individual resampled/
+#          files) from R2 ---
 #
 # resampled/ contains tens of thousands of small files -- uploading/downloading
 # them individually is slow and racks up R2 API requests. Once build_manifest.py
-# finishes, tar the whole resampled/ dir into a single resampled.tar and upload
-# that one object; resume then only has to check for and download a single
-# object (cheap, unambiguous: it either exists complete or doesn't exist at all
-# -- no partial-upload ambiguity like individual files had). A run from before
-# this scheme existed may still have individual resampled/* objects in R2 and
-# no resampled.tar -- fall back to downloading those for build_manifest.py's
-# per-file resumability.
+# finishes, shard_tar.py packs resampled/ into ~1GB tar shards
+# (resampled_shards/shard_NNNNN.tar) plus a manifest.json (uploaded last, once
+# every shard has succeeded). Resume checks for the manifest: if present,
+# downloads+extracts each shard. Sharding (vs one big tar) bounds both the
+# disk overhead (one ~1GB shard alongside resampled/ at a time, not a
+# full-size duplicate) and how much a flaky connection can waste on a reset
+# (one shard, not the whole archive). Runs from before this scheme existed may
+# have a single resampled.tar, or (older still) individual resampled/* objects
+# -- fall back accordingly.
+RESUME_SHARDS=0
 RESUME_TAR=0
 RESUME_FILES=0
 if [ "{RESUME}" = "1" ]; then
-  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled.tar \\
+  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled_shards/manifest.json \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+    RESUME_SHARDS=1
+  elif python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled.tar \\
      && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
        --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
      && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
@@ -288,8 +298,14 @@ if [ "{RESUME}" = "1" ]; then
   fi
 fi
 
-if [ "$RESUME_TAR" = "1" ]; then
-  echo "--resume: found resampled.tar in R2, downloading and extracting instead of rebuilding"
+if [ "$RESUME_SHARDS" = "1" ]; then
+  echo "--resume: found resampled_shards/manifest.json in R2, downloading and extracting shards instead of rebuilding"
+  python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
+    --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
+    --key-prefix {R2_PREFIX}/resampled_shards \\
+    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+elif [ "$RESUME_TAR" = "1" ]; then
+  echo "--resume: no resampled_shards/manifest.json in R2 -- found resampled.tar from an older run, downloading and extracting"
   python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/resampled.tar --file ./data/resampled.tar \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
@@ -299,7 +315,7 @@ if [ "$RESUME_TAR" = "1" ]; then
   rm -f ./data/resampled.tar
 else
   if [ "$RESUME_FILES" = "1" ]; then
-    echo "--resume: no resampled.tar in R2 -- downloading individual resampled/ files"
+    echo "--resume: no resampled_shards/manifest.json or resampled.tar in R2 -- downloading individual resampled/ files"
     echo "  from an older run (if any) for build_manifest.py to reuse"
     python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/resampled --file ./data/resampled || true
@@ -330,29 +346,28 @@ else
 
   # Backup raw manifests + resampled audio to R2 (important intermediary artifacts --
   # if encoding or training fails later, you don't have to re-download/re-resample
-  # on a fresh rental). resampled/ goes up as a single tar (see comment above).
+  # on a fresh rental). resampled/ goes up as ~1GB tar shards (see comment above).
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_raw.jsonl
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/manifest_eval_raw.jsonl
 
   # Free up disk: raw sliced audio (16kHz, from download_slr104.py / download_hiacc.py)
-  # is no longer needed once resampled/ exists. Do this *before* tarring
-  # resampled/ below -- the tar is a same-size duplicate of resampled/ while
-  # it exists on disk, so removing raw audio first keeps that transient bounded.
-  # This matters at our disk budget -- see docs/RUNBOOK.md "Disk budget".
+  # is no longer needed once resampled/ exists. Do this *before* sharding
+  # resampled/ below -- each shard is a transient ~1GB duplicate of part of
+  # resampled/ while it exists on disk, so removing raw audio first keeps that
+  # bounded. This matters at our disk budget -- see docs/RUNBOOK.md "Disk budget".
   rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
 
-  tar -cf ./data/resampled.tar -C ./data resampled \\
+  python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
+    --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
+    --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
     || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/resampled.tar --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled.tar \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-  rm -f ./data/resampled.tar
 
-  # Clean up any individual resampled/ objects left over in R2 from a previous
-  # run that used the old per-file upload scheme -- resampled.tar above is now
-  # the single source of truth.
+  # Clean up objects left over in R2 from previous schemes -- resampled_shards/
+  # above is now the single source of truth.
+  python3 "$REPO/scripts/upload_to_r2.py" --delete --bucket "$R2_BUCKET" \\
+    --key {R2_PREFIX}/resampled.tar || true
   python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/resampled || true
 fi

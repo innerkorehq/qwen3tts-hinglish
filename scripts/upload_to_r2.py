@@ -32,11 +32,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
 from net_utils import r2_boto_config, retry
 
 DEFAULT_CONCURRENCY = 16
+
+# boto3's default multipart settings (8MB chunks, 10 concurrent part uploads)
+# open 10 parallel high-throughput streams per file -- on a home connection
+# with even mild bufferbloat, that's enough to spike latency, trigger
+# retransmits/timeouts, and cause botocore's adaptive retry to tear down and
+# reopen connections faster than they make progress. Fewer, larger parts
+# transfer the same data with far fewer requests and less contention. Used
+# for both upload_file and download_file.
+TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=64 * 1024 * 1024,
+    multipart_chunksize=64 * 1024 * 1024,
+    max_concurrency=4,
+)
 
 _thread_local = threading.local()
 
@@ -95,7 +109,7 @@ def upload_file(client, bucket, local_path, key, quiet=False):
         size_mb = os.path.getsize(local_path) / (1 << 20)
         print(f"Uploading {local_path} ({size_mb:.1f} MB) -> s3://{bucket}/{key}")
     retry(client.upload_file, str(local_path), bucket, key,
-          what=f"upload {key}")
+          Config=TRANSFER_CONFIG, what=f"upload {key}")
 
 
 def _thread_client():
@@ -136,7 +150,7 @@ def download_file(client, bucket, key, local_path, quiet=False):
     if not quiet:
         print(f"Downloading s3://{bucket}/{key} -> {local_path}")
     retry(client.download_file, bucket, key, str(local_path),
-          what=f"download {key}")
+          Config=TRANSFER_CONFIG, what=f"download {key}")
 
 
 def download_dir(client, bucket, key_prefix, local_dir, concurrency=DEFAULT_CONCURRENCY):
@@ -193,6 +207,13 @@ def prefix_exists(client, bucket, key_prefix):
     return resp.get("KeyCount", 0) > 0
 
 
+def delete_object(client, bucket, key):
+    """Delete a single object (best-effort, used to clean up an object left
+    over from a now-superseded scheme, e.g. a single resampled.tar after
+    resampled_shards/ replaces it)."""
+    retry(client.delete_object, Bucket=bucket, Key=key, what=f"delete {key}")
+
+
 def delete_prefix(client, bucket, key_prefix):
     """Delete all objects under key_prefix/ (best-effort, used to clean up
     objects uploaded under a now-superseded scheme, e.g. the individual
@@ -241,8 +262,8 @@ def main():
                          "--exists (MaxKeys=1) can't tell a partial upload from a "
                          "complete one; no --file needed")
     ap.add_argument("--delete", action="store_true",
-                    help="delete all objects under --key prefix (requires --recursive); "
-                         "best-effort cleanup, no --file needed")
+                    help="delete --key (or all objects under --key prefix if "
+                         "--recursive); best-effort cleanup, no --file needed")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"parallel transfers for --recursive (default {DEFAULT_CONCURRENCY})")
     args = ap.parse_args()
@@ -259,11 +280,12 @@ def main():
         return
 
     if args.delete:
-        if not args.recursive:
-            print("ERROR: --delete requires --recursive", file=sys.stderr)
-            sys.exit(1)
-        deleted = delete_prefix(client, args.bucket, args.key)
-        print(f"Deleted {deleted} objects under s3://{args.bucket}/{args.key.rstrip('/')}/")
+        if args.recursive:
+            deleted = delete_prefix(client, args.bucket, args.key)
+            print(f"Deleted {deleted} objects under s3://{args.bucket}/{args.key.rstrip('/')}/")
+        else:
+            delete_object(client, args.bucket, args.key)
+            print(f"Deleted s3://{args.bucket}/{args.key}")
         return
 
     if args.exists:
