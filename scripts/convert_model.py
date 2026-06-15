@@ -36,8 +36,18 @@ import torch
 
 
 def convert_dtype(master_dir: Path, out_dir: Path, dtype_name: str):
-    """Load fp32 master, cast to target dtype, save."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load fp32 master, cast to target dtype, save.
+
+    qwen3_tts is a custom architecture not registered with transformers'
+    AutoModel/AutoConfig, so it must be loaded via Qwen3TTSModel (the same
+    class train.py uses) rather than AutoModelForCausalLM. Saving reuses
+    train.py's save_checkpoint(), which writes a self-contained checkpoint
+    dir (config/processor files + a single model.safetensors) the same way
+    final_fp32/final_bf16 were originally produced.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+    from train import save_checkpoint
 
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     if dtype_name not in dtype_map:
@@ -45,16 +55,10 @@ def convert_dtype(master_dir: Path, out_dir: Path, dtype_name: str):
     target_dtype = dtype_map[dtype_name]
 
     print(f"Loading fp32 master from {master_dir} ...")
-    model = AutoModelForCausalLM.from_pretrained(master_dir, torch_dtype=torch.float32)
-    tokenizer = AutoTokenizer.from_pretrained(master_dir)
+    model = Qwen3TTSModel.from_pretrained(master_dir, torch_dtype=torch.float32)
 
-    print(f"Casting to {dtype_name} ...")
-    model = model.to(target_dtype)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Saving {dtype_name} model to {out_dir} ...")
-    model.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
+    print(f"Casting to {dtype_name} and saving to {out_dir} ...")
+    save_checkpoint(model, master_dir, out_dir, dtype=target_dtype)
 
     print(f"Done. {dtype_name} model at {out_dir}")
     if dtype_name == "fp16":

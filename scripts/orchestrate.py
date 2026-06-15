@@ -446,13 +446,43 @@ fi
 python3 "$REPO/scripts/train.py" --config "$REPO/configs/train_config.yaml" $TRAIN_RESUME_FLAG \\
   || {{ mark_done FAILED_TRAIN; exit 1; }}
 
-# --- 6. convert fp32 master -> fp16 (for MPS/M4 inference) ---
+# --- 6. upload the core checkpoints (final artifacts -> R2) ---
+# Trained checkpoints exist only on this instance's container disk, and the
+# cleanup trap self-destructs the instance regardless of exit status -- so
+# upload final_fp32/final_bf16 *before* attempting any post-processing
+# (fp16/GGUF conversion below). A conversion failure must never risk losing
+# a completed training run. Retry each upload a few times before giving up.
+upload_with_retry() {{
+  for attempt in 1 2 3; do
+    if python3 "$REPO/scripts/upload_to_r2.py" --file "$1" --bucket "$R2_BUCKET" --key "$2" --recursive; then
+      return 0
+    fi
+    echo "upload attempt $attempt for $2 failed, retrying in 30s ..."
+    sleep 30
+  done
+  return 1
+}}
+
+upload_with_retry ./checkpoints/final_fp32 {R2_PREFIX}/final_fp32 \\
+  || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
+
+upload_with_retry ./checkpoints/final_bf16 {R2_PREFIX}/final_bf16 \\
+  || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
+
+# --- 7. convert fp32 master -> fp16 (for MPS/M4 inference). Failure here is
+#        NOT fatal -- final_fp32/final_bf16 are already safely uploaded above
+#        and are usable on their own. ---
 python3 "$REPO/scripts/convert_model.py" \\
   --master ./checkpoints/final_fp32 \\
   --to fp16 --out ./checkpoints/final_fp16 \\
-  || {{ mark_done FAILED_CONVERT_FP16; exit 1; }}
+  && echo "fp16 conversion succeeded" \\
+  || echo "fp16 conversion failed (final_fp32/final_bf16 still usable). Continuing."
 
-# --- 7. attempt GGUF conversion (may fail for Qwen3-TTS -- see convert_model.py
+if [ -d ./checkpoints/final_fp16 ]; then
+  upload_with_retry ./checkpoints/final_fp16 {R2_PREFIX}/final_fp16 || true
+fi
+
+# --- 8. attempt GGUF conversion (may fail for Qwen3-TTS -- see convert_model.py
 #        docstring; failure here does NOT abort the pipeline, since fp32/fp16
 #        checkpoints are already usable for cross-device inference) ---
 for i in 1 2 3; do
@@ -471,31 +501,6 @@ if [ -f ./llama.cpp/convert_hf_to_gguf.py ]; then
 else
   echo "llama.cpp clone failed or convert script missing -- skipping GGUF, continuing."
 fi
-
-# --- 8. upload all checkpoint variants + logs (final artifacts -> R2) ---
-# Trained checkpoints exist only on this instance's container disk, and the
-# cleanup trap self-destructs the instance regardless of upload outcome -- so
-# retry each checkpoint upload a few times before giving up, to minimize the
-# chance of losing a completed training run to a transient R2 hiccup.
-upload_with_retry() {{
-  for attempt in 1 2 3; do
-    if python3 "$REPO/scripts/upload_to_r2.py" --file "$1" --bucket "$R2_BUCKET" --key "$2" --recursive; then
-      return 0
-    fi
-    echo "upload attempt $attempt for $2 failed, retrying in 30s ..."
-    sleep 30
-  done
-  return 1
-}}
-
-upload_with_retry ./checkpoints/final_fp32 {R2_PREFIX}/final_fp32 \\
-  || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
-
-upload_with_retry ./checkpoints/final_bf16 {R2_PREFIX}/final_bf16 \\
-  || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
-
-upload_with_retry ./checkpoints/final_fp16 {R2_PREFIX}/final_fp16 \\
-  || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
 
 # Upload GGUF only if it was produced (best-effort, doesn't fail the run)
 if [ -d ./checkpoints/final_gguf ]; then
