@@ -283,102 +283,12 @@ fi
 # --- 1. bootstrap deps (GPU/disk checks, Python deps, sox, flash-attn) ---
 bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 1; }}
 
-# --- 2/3. download datasets + build unified manifest -- or, with --resume,
-#          reuse a prior run's manifest + resampled_shards/ (or older
-#          resampled.tar / resampled/* schemes) from R2. See RUNBOOK.md
-#          "Resuming a failed run" for the sharding rationale. ---
-RESUME_SHARDS=0
-RESUME_TAR=0
-RESUME_FILES=0
-if [ "{RESUME}" = "1" ]; then
-  if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled_shards/manifest.json \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
-    RESUME_SHARDS=1
-  elif python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled.tar \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
-    RESUME_TAR=1
-  elif python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
-     && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-       --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
-    RESUME_FILES=1
-  fi
-fi
-
-if [ "$RESUME_SHARDS" = "1" ]; then
-  echo "--resume: found resampled_shards/manifest.json in R2, downloading and extracting shards instead of rebuilding"
-  python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
-    --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
-    --key-prefix {R2_PREFIX}/resampled_shards \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-elif [ "$RESUME_TAR" = "1" ]; then
-  echo "--resume: no resampled_shards/manifest.json in R2 -- found resampled.tar from an older run, downloading and extracting"
-  python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled.tar --file ./data/resampled.tar \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-  mkdir -p ./data/resampled
-  tar -xf ./data/resampled.tar -C ./data \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-  rm -f ./data/resampled.tar
-else
-  if [ "$RESUME_FILES" = "1" ]; then
-    echo "--resume: no resampled_shards/manifest.json or resampled.tar in R2 -- downloading individual resampled/ files"
-    echo "  from an older run (if any) for build_manifest.py to reuse"
-    python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
-      --key {R2_PREFIX}/resampled --file ./data/resampled || true
-  fi
-
-  python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
-    || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
-
-  python3 "$REPO/scripts/download_slr104.py" \\
-    --out-dir ./data/raw/slr104 \\
-    --pairs {SLR104_PAIRS} \\
-    {SLR104_TEST_ARG} \\
-    || {{ mark_done FAILED_DOWNLOAD_SLR104; exit 1; }}
-
-  python3 "$REPO/scripts/build_manifest.py" \\
-    --hiacc-dir ./data/raw/hiacc \\
-    --slr104-dir ./data/raw/slr104 \\
-    --out ./data/manifest_raw.jsonl \\
-    --resampled-dir ./data/resampled \\
-    --eval-frac {EVAL_FRAC} \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-
-  # manifest_eval_raw.jsonl is written alongside --out (same stem + _eval_raw)
-  if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
-    mark_done FAILED_BUILD_MANIFEST; exit 1
-  fi
-
-  # Backup raw manifests + resampled audio to R2 as ~1GB tar shards.
-  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/manifest_raw.jsonl
-  python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/manifest_eval_raw.jsonl
-
-  # Free disk before sharding -- see RUNBOOK.md "Disk budget".
-  rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
-
-  python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
-    --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
-    --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
-    || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-
-  # Clean up objects from older schemes -- resampled_shards/ is now canonical.
-  python3 "$REPO/scripts/upload_to_r2.py" --delete --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled.tar || true
-  python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
-    --key {R2_PREFIX}/resampled || true
-fi
-
-# --- 4. encode audio -> codes -- or, with --resume, reuse a prior run's
-#        train_with_codes.jsonl/eval_with_codes.jsonl from R2 ---
+# --- 2-4. get train_with_codes.jsonl/eval_with_codes.jsonl -- or, with
+#          --resume, reuse a prior run's already-encoded codes from R2
+#          directly, skipping manifest/resampled-audio entirely (the encoded
+#          codes are the only thing stages 5+ need; raw/resampled audio is
+#          only an intermediate for stage 4). See RUNBOOK.md "Resuming a
+#          failed run". ---
 RESUME_CODES=0
 if [ "{RESUME}" = "1" ]; then
   if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/train_with_codes.jsonl \\
@@ -388,7 +298,7 @@ if [ "{RESUME}" = "1" ]; then
 fi
 
 if [ "$RESUME_CODES" = "1" ]; then
-  echo "--resume: found encoded codes in R2, downloading instead of re-encoding"
+  echo "--resume: found encoded codes in R2, downloading instead of rebuilding manifest/resampled audio/codes"
   python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/train_with_codes.jsonl --file ./data/train_with_codes.jsonl \\
     || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
@@ -396,6 +306,101 @@ if [ "$RESUME_CODES" = "1" ]; then
     --key {R2_PREFIX}/eval_with_codes.jsonl --file ./data/eval_with_codes.jsonl \\
     || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
 else
+  # --- 2/3. download datasets + build unified manifest -- or, with --resume,
+  #          reuse a prior run's manifest + resampled_shards/ (or older
+  #          resampled.tar / resampled/* schemes) from R2. See RUNBOOK.md
+  #          "Resuming a failed run" for the sharding rationale. ---
+  RESUME_SHARDS=0
+  RESUME_TAR=0
+  RESUME_FILES=0
+  if [ "{RESUME}" = "1" ]; then
+    if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled_shards/manifest.json \\
+       && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+       && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+      RESUME_SHARDS=1
+    elif python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/resampled.tar \\
+       && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+       && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+      RESUME_TAR=1
+    elif python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_raw.jsonl --file ./data/manifest_raw.jsonl \\
+       && python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+         --key {R2_PREFIX}/manifest_eval_raw.jsonl --file ./data/manifest_eval_raw.jsonl; then
+      RESUME_FILES=1
+    fi
+  fi
+
+  if [ "$RESUME_SHARDS" = "1" ]; then
+    echo "--resume: found resampled_shards/manifest.json in R2, downloading and extracting shards instead of rebuilding"
+    python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
+      --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
+      --key-prefix {R2_PREFIX}/resampled_shards \\
+      || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+  elif [ "$RESUME_TAR" = "1" ]; then
+    echo "--resume: no resampled_shards/manifest.json in R2 -- found resampled.tar from an older run, downloading and extracting"
+    python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/resampled.tar --file ./data/resampled.tar \\
+      || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+    mkdir -p ./data/resampled
+    tar -xf ./data/resampled.tar -C ./data \\
+      || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+    rm -f ./data/resampled.tar
+  else
+    if [ "$RESUME_FILES" = "1" ]; then
+      echo "--resume: no resampled_shards/manifest.json or resampled.tar in R2 -- downloading individual resampled/ files"
+      echo "  from an older run (if any) for build_manifest.py to reuse"
+      python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
+        --key {R2_PREFIX}/resampled --file ./data/resampled || true
+    fi
+
+    python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
+      || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
+
+    python3 "$REPO/scripts/download_slr104.py" \\
+      --out-dir ./data/raw/slr104 \\
+      --pairs {SLR104_PAIRS} \\
+      {SLR104_TEST_ARG} \\
+      || {{ mark_done FAILED_DOWNLOAD_SLR104; exit 1; }}
+
+    python3 "$REPO/scripts/build_manifest.py" \\
+      --hiacc-dir ./data/raw/hiacc \\
+      --slr104-dir ./data/raw/slr104 \\
+      --out ./data/manifest_raw.jsonl \\
+      --resampled-dir ./data/resampled \\
+      --eval-frac {EVAL_FRAC} \\
+      || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+
+    # manifest_eval_raw.jsonl is written alongside --out (same stem + _eval_raw)
+    if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
+      mark_done FAILED_BUILD_MANIFEST; exit 1
+    fi
+
+    # Backup raw manifests + resampled audio to R2 as ~1GB tar shards.
+    python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/manifest_raw.jsonl
+    python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/manifest_eval_raw.jsonl
+
+    # Free disk before sharding -- see RUNBOOK.md "Disk budget".
+    rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
+
+    python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
+      --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
+      --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
+      || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+
+    # Clean up objects from older schemes -- resampled_shards/ is now canonical.
+    python3 "$REPO/scripts/upload_to_r2.py" --delete --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/resampled.tar || true
+    python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
+      --key {R2_PREFIX}/resampled || true
+  fi
+
+  # --- 4. encode audio -> codes ---
   python3 "$REPO/scripts/encode_codes.py" \\
     --manifest ./data/manifest_raw.jsonl \\
     --out ./data/train_with_codes.jsonl \\

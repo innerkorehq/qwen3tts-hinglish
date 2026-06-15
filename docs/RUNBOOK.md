@@ -587,8 +587,14 @@ after each epoch, `--max-steps` for dry-run timing.
 failed run) makes each pipeline stage check R2 for a prior run's output before
 recomputing it:
 
-- **Download + manifest**: tries three resume tiers, newest first, by checking
-  R2 for each scheme's output plus `manifest_raw.jsonl`/`manifest_eval_raw.jsonl`:
+- **Encode** (checked first): if `train_with_codes.jsonl` and
+  `eval_with_codes.jsonl` exist in R2, downloads them directly and skips
+  download/manifest/resampling entirely -- raw and resampled audio are only
+  an intermediate for producing the encoded codes, so once the codes exist
+  there's nothing left for those stages to produce.
+- **Download + manifest** (only if encoded codes aren't in R2 yet): tries
+  three resume tiers, newest first, by checking R2 for each scheme's output
+  plus `manifest_raw.jsonl`/`manifest_eval_raw.jsonl`:
   - **`RESUME_SHARDS`** (current scheme): if `resampled_shards/manifest.json`
     exists in R2 and both manifests download successfully, downloads +
     extracts each `resampled_shards/shard_NNNNN.tar` via
@@ -626,8 +632,6 @@ recomputing it:
   convert it once, ahead of time -- it downloads + extracts whichever of the
   two older schemes is present, shards + uploads `resampled_shards/`, and
   deletes the superseded objects.
-- **Encode**: if `train_with_codes.jsonl` and `eval_with_codes.jsonl` exist in
-  R2, downloads them instead of re-running `encode_codes.py`.
 - **Train**: if `accel_state/` and `training_state.json` exist in R2, downloads
   them into `./checkpoints/` and passes `--resume` to `train.py`, which calls
   `accelerator.load_state()` and reads `training_state.json` to skip already-
