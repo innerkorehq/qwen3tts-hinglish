@@ -175,9 +175,15 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
 
     if REPO_GIT_URL:
         clone_cmd = (
+            f"echo 'waiting for network ...'\n"
+            f"for i in $(seq 1 20); do\n"
+            f"  curl -sf --max-time 5 https://github.com > /dev/null && break\n"
+            f"  echo \"  network not ready (attempt $i/20), sleeping 5s ...\"\n"
+            f"  sleep 5\n"
+            f"done\n"
             f"for i in 1 2 3 4 5; do\n"
             f"  rm -rf repo\n"
-            f"  if git clone --depth 1 {REPO_GIT_URL} repo; then break; fi\n"
+            f"  if GIT_SSL_NO_VERIFY=0 git clone --depth 1 {REPO_GIT_URL} repo; then break; fi\n"
             f'  echo "git clone attempt $i/5 failed, retrying in $((i*10))s ..."\n'
             f"  sleep $((i*10))\n"
             f"done"
