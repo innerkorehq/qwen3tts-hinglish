@@ -306,10 +306,7 @@ if [ "$RESUME_CODES" = "1" ]; then
     --key {R2_PREFIX}/eval_with_codes.jsonl --file ./data/eval_with_codes.jsonl \\
     || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
 
-  # train_with_codes.jsonl has absolute ref_audio paths pointing to
-  # ./data/resampled/ -- TTSDataset loads these at training time for
-  # per-sample speaker embeddings. Must download even when codes are cached.
-  echo "--resume: downloading resampled audio (needed for speaker embeddings at train time) ..."
+  echo "--resume: downloading resampled audio for speaker embeddings ..."
   python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
     --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
     --key-prefix {R2_PREFIX}/resampled_shards \\
