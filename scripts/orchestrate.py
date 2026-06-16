@@ -92,11 +92,13 @@ def run(cmd, check=True, capture=True, quiet=False):
 
 
 def search_offers(
-    max_price, min_disk, gpu=None, min_reliability=0.95, min_vram_gb=None
+    max_price, min_disk, gpu=None, min_reliability=0.95, min_vram_gb=None,
+    exclude_machines=None,
 ):
     """Search vast.ai for offers matching any of `gpu` (e.g. A100_PCIE and/or
     A100_SXM4) with enough disk/VRAM/reliability, sorted by price. If `gpu` is
-    None/empty, no gpu_name filter is applied (any GPU)."""
+    None/empty, no gpu_name filter is applied (any GPU).
+    exclude_machines: set of machine_id ints to skip."""
     clauses = [
         "num_gpus=1",
         f"reliability>{min_reliability}",
@@ -126,6 +128,16 @@ def search_offers(
     if not offers:
         print(f"No offers found matching: {query}", file=sys.stderr)
         sys.exit(1)
+
+    if exclude_machines:
+        before = len(offers)
+        offers = [o for o in offers if o.get("machine_id") not in exclude_machines]
+        skipped = before - len(offers)
+        if skipped:
+            print(f"  excluded {skipped} offer(s) from blacklisted machine(s): {sorted(exclude_machines)}")
+        if not offers:
+            print("ERROR: no offers remain after excluding blacklisted machines.", file=sys.stderr)
+            sys.exit(1)
 
     offers.sort(key=lambda o: o.get("dph_total", 999))
     return offers
@@ -264,6 +276,11 @@ if [ "$RESUME_CODES" = "1" ]; then
   python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
     --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
     --key-prefix {R2_PREFIX}/resampled_shards \\
+    || {{ mark_done FAILED_TRAIN; exit 1; }}
+  echo "Rewriting audio paths in codes JSONL to instance paths ..."
+  python3 "$REPO/scripts/rewrite_paths.py" \\
+    ./data/train_with_codes.jsonl ./data/eval_with_codes.jsonl \\
+    --resampled-root /root/work/data/resampled \\
     || {{ mark_done FAILED_TRAIN; exit 1; }}
 else
   RESUME_SHARDS=0
@@ -567,6 +584,14 @@ def main():
         help="minimum vast.ai reliability score, 0-1 (default 0.95)",
     )
     ap.add_argument(
+        "--exclude-machine",
+        nargs="+",
+        type=int,
+        default=[],
+        metavar="MACHINE_ID",
+        help="vast.ai machine_id(s) to skip (e.g. known-bad hosts)",
+    )
+    ap.add_argument(
         "--poll-interval",
         type=int,
         default=300,
@@ -654,12 +679,14 @@ def main():
             gpu=args.gpu,
             min_reliability=args.min_reliability,
             min_vram_gb=args.min_vram,
+            exclude_machines=set(args.exclude_machine),
         )
         best = offers[0]
         print(f"\\nTop {min(5, len(offers))} offers:")
         for o in offers[:5]:
             print(
-                f"  id={o['id']} ${o['dph_total']:.3f}/hr "
+                f"  id={o['id']} machine={o.get('machine_id','?')} "
+                f"${o['dph_total']:.3f}/hr "
                 f"reliability={o.get('reliability', 0):.3f} "
                 f"disk={o.get('disk_space')}GB "
                 f"loc={o.get('geolocation', '?')}"
