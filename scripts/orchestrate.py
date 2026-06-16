@@ -483,8 +483,10 @@ python3 "$REPO/scripts/convert_model.py" \\
   && echo "fp16 conversion succeeded" \\
   || echo "fp16 conversion failed (final_fp32/final_bf16 still usable). Continuing."
 
-if [ -d ./checkpoints/final_fp16 ]; then
+if [ -f ./checkpoints/final_fp16/model.safetensors ]; then
   upload_with_retry ./checkpoints/final_fp16 {R2_PREFIX}/final_fp16 || true
+else
+  echo "WARNING: skipping final_fp16 upload -- model.safetensors missing (conversion failed or incomplete)"
 fi
 
 # --- 8. attempt GGUF conversion (may fail for Qwen3-TTS -- see convert_model.py

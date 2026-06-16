@@ -116,16 +116,18 @@ def main():
 
     pf = open(partial_path, "a")
     processed_since_flush = 0
+    total_failed = 0
 
     for i in range(0, len(todo), args.batch_size):
         batch = todo[i:i + args.batch_size]
-        encoded, _failed = encode_batch(tokenizer, batch)
+        encoded, failed = encode_batch(tokenizer, batch)
+        total_failed += len(failed)
         for rec_out in encoded:
             pf.write(json.dumps(rec_out, ensure_ascii=False) + "\n")
         processed_since_flush += len(encoded)
 
         done_so_far = min(i + args.batch_size, len(todo))
-        print(f"  [{done_so_far}/{len(todo)}] encoded")
+        print(f"  [{done_so_far}/{len(todo)}] encoded (failed so far: {total_failed})")
 
         if processed_since_flush >= args.checkpoint_every:
             pf.flush()
@@ -134,13 +136,21 @@ def main():
 
     pf.close()
 
+    if total_failed > 0:
+        fail_pct = total_failed / len(todo) * 100
+        msg = f"encode_codes: {total_failed}/{len(todo)} files failed to encode ({fail_pct:.1f}%)"
+        if fail_pct > 5:
+            print(f"ERROR: {msg} -- too many failures, refusing to produce corrupt training data", file=sys.stderr)
+            sys.exit(1)
+        print(f"WARNING: {msg} -- these clips will be absent from training data")
+
     # Merge partial into final output (append-only -- safe to rerun)
     print("Merging partial results into final output ...")
     with open(out_path, "a") as out_f, open(partial_path) as in_f:
         for line in in_f:
             out_f.write(line)
 
-    print(f"Done. Output: {out_path}")
+    print(f"Done. Output: {out_path} ({len(todo) - total_failed} encoded, {total_failed} skipped)")
     print("You can safely delete the .partial file now, or keep it as a backup:")
     print(f"  {partial_path}")
 
