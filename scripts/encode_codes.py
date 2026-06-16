@@ -77,9 +77,16 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--checkpoint-every", type=int, default=200,
                     help="flush partial progress to disk every N samples")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="total number of parallel worker shards")
+    ap.add_argument("--shard-idx", type=int, default=0,
+                    help="index of this shard (0-based, must be < --num-shards)")
     args = ap.parse_args()
 
-    out_path = Path(args.out)
+    if args.num_shards > 1:
+        out_path = Path(args.out).with_suffix(f".shard{args.shard_idx}.jsonl")
+    else:
+        out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     partial_path = out_path.with_suffix(out_path.suffix + ".partial")
 
@@ -110,6 +117,13 @@ def main():
             if not line:
                 continue
             records.append(json.loads(line))
+
+    # Shard: each worker handles every Nth record starting at shard_idx.
+    # Records are assigned by position so shards are interleaved (not contiguous)
+    # giving each worker a representative mix of durations/sources.
+    if args.num_shards > 1:
+        records = [r for i, r in enumerate(records) if i % args.num_shards == args.shard_idx]
+        print(f"Shard {args.shard_idx}/{args.num_shards}: {len(records)} records assigned to this worker")
 
     todo = [r for r in records if r["audio"] not in done_keys]
     print(f"Total records: {len(records)}, remaining to encode: {len(todo)}")

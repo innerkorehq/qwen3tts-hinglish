@@ -198,11 +198,11 @@ echo "=== START $(date) ==="
 cd /root
 {clone_cmd}
 REPO=/root/repo
-export R2_ACCOUNT_ID="{os.environ.get("R2_ACCOUNT_ID", "")}"
-export R2_ACCESS_KEY_ID="{os.environ.get("R2_ACCESS_KEY_ID", "")}"
-export R2_SECRET_ACCESS_KEY="{os.environ.get("R2_SECRET_ACCESS_KEY", "")}"
-export R2_BUCKET="{os.environ.get("R2_BUCKET", "")}"
-export HF_TOKEN="{os.environ.get("HF_TOKEN", os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))}"
+export R2_ACCOUNT_ID='{os.environ.get("R2_ACCOUNT_ID", "")}'
+export R2_ACCESS_KEY_ID='{os.environ.get("R2_ACCESS_KEY_ID", "")}'
+export R2_SECRET_ACCESS_KEY='{os.environ.get("R2_SECRET_ACCESS_KEY", "")}'
+export R2_BUCKET='{os.environ.get("R2_BUCKET", "")}'
+export HF_TOKEN='{os.environ.get("HF_TOKEN", os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))}'
 for i in 1 2 3 4 5; do
   pip install -q vastai 2>/dev/null && break
   sleep $((i*5))
