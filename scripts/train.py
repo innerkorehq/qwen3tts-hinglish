@@ -300,7 +300,7 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = t["lr"]
             group["initial_lr"] = t["lr"]
-        lr_scheduler.base_lrs = [t["lr"] for _ in lr_scheduler.base_lrs]
+        lr_scheduler.scheduler.base_lrs = [t["lr"] for _ in lr_scheduler.scheduler.base_lrs]
         accelerator.print(f"  re-applied lr={t['lr']:.2e} from config (overriding resumed optimizer/scheduler state)")
 
         with open(state_path) as f:
