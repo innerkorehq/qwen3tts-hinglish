@@ -193,66 +193,33 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
     script = f"""#!/bin/bash
 set -uo pipefail
 exec > /root/pipeline.log 2>&1
-
-# Unbuffered stdout/stderr -- without this, Python's block-buffering on a
-# redirected (non-tty) stream means pipeline.log can appear "stuck" on a
-# stale tqdm progress line for a long time even while a download/training
-# step is actively progressing.
 export PYTHONUNBUFFERED=1
-
 echo "=== START $(date) ==="
-
 cd /root
 {clone_cmd}
 REPO=/root/repo
-
-# --- env for R2 ---
 export R2_ACCOUNT_ID="{os.environ.get("R2_ACCOUNT_ID", "")}"
 export R2_ACCESS_KEY_ID="{os.environ.get("R2_ACCESS_KEY_ID", "")}"
 export R2_SECRET_ACCESS_KEY="{os.environ.get("R2_SECRET_ACCESS_KEY", "")}"
 export R2_BUCKET="{os.environ.get("R2_BUCKET", "")}"
-
-# --- HF_TOKEN (optional): huggingface_hub picks this up automatically for
-# snapshot_download/from_pretrained. Not required for the current public
-# Qwen3-TTS-12Hz-1.7B-Base repo, but (a) anonymous HF downloads are subject to
-# tighter rate limits / throttling -- a likely contributor to CDN stalls --
-# and (b) covers the model becoming gated later. Set HF_TOKEN locally before
-# running orchestrate.py to pass it through; harmless if empty. ---
 export HF_TOKEN="{os.environ.get("HF_TOKEN", os.environ.get("HUGGING_FACE_HUB_TOKEN", ""))}"
-
-# --- Complete handoff: install vastai CLI immediately so the cleanup trap
-# below can self-destruct the instance no matter where the pipeline fails.
-# Retried -- if this never installs, self-destruct can't run later, so it's
-# worth a few attempts against a flaky PyPI mirror. ---
 for i in 1 2 3 4 5; do
   pip install -q vastai 2>/dev/null && break
-  echo "pip install vastai attempt $i/5 failed, retrying in $((i*5))s ..."
   sleep $((i*5))
 done
-
 mark_done() {{
   echo "$1" > /root/DONE
   echo "=== END $(date) status=$1 ==="
 }}
-
-# --- Cleanup trap: runs on ANY exit (success, FAILED_*, or an unexpected
-# crash/signal). Uploads logs + a status file to R2 (so the run is debuggable
-# even with the instance gone) and self-destructs the instance via the
-# instance-scoped CONTAINER_ID/CONTAINER_API_KEY -- this is what makes the
-# instance independent of the M4 orchestrator: it stops billing on its own
-# even if the orchestrator is offline. See docs/RUNBOOK.md "Self-destruct and
-# handoff".
 CLEANED_UP=0
 cleanup() {{
   if [ "$CLEANED_UP" = "1" ]; then return; fi
   CLEANED_UP=1
-
   if [ ! -f /root/DONE ]; then
     echo "UNKNOWN_EXIT" > /root/DONE
-    echo "=== END $(date) status=UNKNOWN_EXIT (unexpected crash/signal) ==="
+    echo "=== END $(date) status=UNKNOWN_EXIT ==="
   fi
   STATUS=$(cat /root/DONE)
-
   python3 "$REPO/scripts/upload_to_r2.py" --file /root/pipeline.log --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/logs/pipeline.log 2>/dev/null || true
   python3 "$REPO/scripts/upload_to_r2.py" --file /root/DONE --bucket "$R2_BUCKET" \\
@@ -261,34 +228,18 @@ cleanup() {{
     python3 "$REPO/scripts/upload_to_r2.py" --file /root/pipeline.log --bucket "$R2_BUCKET" \\
       --key "{R2_PREFIX}/logs/pipeline_failed_${{STATUS}}_$(date +%s).log" 2>/dev/null || true
   fi
-
-  echo "Self-destructing instance $CONTAINER_ID (status=$STATUS) ..."
   vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" -y || true
 }}
 trap cleanup EXIT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 130' INT
-
-# --- All working data lives under /root/work on the instance's container disk ---
-# (final and important intermediary artifacts are also pushed to R2 below;
-# /root/work disappears with the instance at the end of the run)
 mkdir -p /root/work
 cd /root/work
 mkdir -p data models checkpoints
-
 if [ ! -d "$REPO" ]; then
   mark_done FAILED_BOOTSTRAP; exit 1
 fi
-
-# --- 1. bootstrap deps (GPU/disk checks, Python deps, sox, flash-attn) ---
 bash "$REPO/scripts/bootstrap_vastai.sh" || {{ mark_done FAILED_BOOTSTRAP; exit 1; }}
-
-# --- 2-4. get train_with_codes.jsonl/eval_with_codes.jsonl -- or, with
-#          --resume, reuse a prior run's already-encoded codes from R2
-#          directly, skipping manifest/resampled-audio entirely (the encoded
-#          codes are the only thing stages 5+ need; raw/resampled audio is
-#          only an intermediate for stage 4). See RUNBOOK.md "Resuming a
-#          failed run". ---
 RESUME_CODES=0
 if [ "{RESUME}" = "1" ]; then
   if python3 "$REPO/scripts/upload_to_r2.py" --exists --bucket "$R2_BUCKET" --key {R2_PREFIX}/train_with_codes.jsonl \\
@@ -296,26 +247,19 @@ if [ "{RESUME}" = "1" ]; then
     RESUME_CODES=1
   fi
 fi
-
 if [ "$RESUME_CODES" = "1" ]; then
-  echo "--resume: found encoded codes in R2, downloading instead of rebuilding manifest/resampled audio/codes"
+  echo "--resume: codes in R2, downloading codes + resampled audio"
   python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/train_with_codes.jsonl --file ./data/train_with_codes.jsonl \\
     || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
   python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/eval_with_codes.jsonl --file ./data/eval_with_codes.jsonl \\
     || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
-
-  echo "--resume: downloading resampled audio for speaker embeddings ..."
   python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
     --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
     --key-prefix {R2_PREFIX}/resampled_shards \\
     || {{ mark_done FAILED_TRAIN; exit 1; }}
 else
-  # --- 2/3. download datasets + build unified manifest -- or, with --resume,
-  #          reuse a prior run's manifest + resampled_shards/ (or older
-  #          resampled.tar / resampled/* schemes) from R2. See RUNBOOK.md
-  #          "Resuming a failed run" for the sharding rationale. ---
   RESUME_SHARDS=0
   RESUME_TAR=0
   RESUME_FILES=0
@@ -339,15 +283,14 @@ else
       RESUME_FILES=1
     fi
   fi
-
   if [ "$RESUME_SHARDS" = "1" ]; then
-    echo "--resume: found resampled_shards/manifest.json in R2, downloading and extracting shards instead of rebuilding"
+    echo "--resume: downloading resampled_shards"
     python3 "$REPO/scripts/shard_tar.py" download --dest-dir ./data \\
       --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
       --key-prefix {R2_PREFIX}/resampled_shards \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
   elif [ "$RESUME_TAR" = "1" ]; then
-    echo "--resume: no resampled_shards/manifest.json in R2 -- found resampled.tar from an older run, downloading and extracting"
+    echo "--resume: downloading resampled.tar"
     python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/resampled.tar --file ./data/resampled.tar \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
@@ -357,21 +300,16 @@ else
     rm -f ./data/resampled.tar
   else
     if [ "$RESUME_FILES" = "1" ]; then
-      echo "--resume: no resampled_shards/manifest.json or resampled.tar in R2 -- downloading individual resampled/ files"
-      echo "  from an older run (if any) for build_manifest.py to reuse"
       python3 "$REPO/scripts/upload_to_r2.py" --download --recursive --bucket "$R2_BUCKET" \\
         --key {R2_PREFIX}/resampled --file ./data/resampled || true
     fi
-
     python3 "$REPO/scripts/download_hiacc.py" --out-dir ./data/raw/hiacc \\
       || {{ mark_done FAILED_DOWNLOAD_HIACC; exit 1; }}
-
     python3 "$REPO/scripts/download_slr104.py" \\
       --out-dir ./data/raw/slr104 \\
       --pairs {SLR104_PAIRS} \\
       {SLR104_TEST_ARG} \\
       || {{ mark_done FAILED_DOWNLOAD_SLR104; exit 1; }}
-
     python3 "$REPO/scripts/build_manifest.py" \\
       --hiacc-dir ./data/raw/hiacc \\
       --slr104-dir ./data/raw/slr104 \\
@@ -379,63 +317,39 @@ else
       --resampled-dir ./data/resampled \\
       --eval-frac {EVAL_FRAC} \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-
-    # manifest_eval_raw.jsonl is written alongside --out (same stem + _eval_raw)
     if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
       mark_done FAILED_BUILD_MANIFEST; exit 1
     fi
-
-    # Backup raw manifests + resampled audio to R2 as ~1GB tar shards.
     python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/manifest_raw.jsonl
     python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/manifest_eval_raw.jsonl
-
-    # Free disk before sharding -- see RUNBOOK.md "Disk budget".
     rm -rf ./data/raw/slr104/*/audio ./data/raw/hiacc
-
     python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
       --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
       --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
-
-    # Clean up objects from older schemes -- resampled_shards/ is now canonical.
     python3 "$REPO/scripts/upload_to_r2.py" --delete --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/resampled.tar || true
     python3 "$REPO/scripts/upload_to_r2.py" --delete --recursive --bucket "$R2_BUCKET" \\
       --key {R2_PREFIX}/resampled || true
   fi
-
-  # --- 4. encode audio -> codes ---
   python3 "$REPO/scripts/encode_codes.py" \\
     --manifest ./data/manifest_raw.jsonl \\
     --out ./data/train_with_codes.jsonl \\
     --device cuda --batch-size 32 \\
     || {{ mark_done FAILED_ENCODE_TRAIN; exit 1; }}
-
   python3 "$REPO/scripts/encode_codes.py" \\
     --manifest ./data/manifest_eval_raw.jsonl \\
     --out ./data/eval_with_codes.jsonl \\
     --device cuda --batch-size 32 \\
     || {{ mark_done FAILED_ENCODE_EVAL; exit 1; }}
-
-  # Backup encoded codes to R2 (important intermediary artifact -- small files)
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/train_with_codes.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/train_with_codes.jsonl
   python3 "$REPO/scripts/upload_to_r2.py" --file ./data/eval_with_codes.jsonl --bucket "$R2_BUCKET" \\
     --key {R2_PREFIX}/eval_with_codes.jsonl
 fi
-
-# --- 4.5. download base model (init_model_path for train.py) -- done here,
-#          after resampling/encoding and the raw-data cleanup in step 2/3,
-#          rather than during bootstrap, so its ~6.8GB isn't sitting on disk
-#          during build_manifest's peak-transient window. See docs/RUNBOOK.md
-#          "Disk budget". ---
 bash "$REPO/scripts/download_base_model.sh" || {{ mark_done FAILED_DOWNLOAD_MODEL; exit 1; }}
-
-# --- 5. train (produces final_fp32, final_bf16, final aliased to fp32) -- or,
-#        with --resume, reuse a prior run's accel_state/training_state.json
-#        from R2 and continue from there ---
 TRAIN_RESUME_FLAG=""
 if [ "{RESUME}" = "1" ]; then
   if python3 "$REPO/scripts/upload_to_r2.py" --exists --recursive --bucket "$R2_BUCKET" --key {R2_PREFIX}/accel_state \\
@@ -448,60 +362,32 @@ if [ "{RESUME}" = "1" ]; then
     TRAIN_RESUME_FLAG="--resume"
   fi
 fi
-
-# train_config.yaml paths (init_model_path, output_model_path, data files) are
-# relative to cwd, which is /root/work here -- see configs/train_config.yaml comment.
-# train.py itself uploads accel_state/training_state.json/best to R2 after each
-# epoch (if R2 env vars are set, which they are above) -- this is what makes
-# FAILED_TRAIN recoverable via --resume on a fresh instance.
 python3 "$REPO/scripts/train.py" --config "$REPO/configs/train_config.yaml" $TRAIN_RESUME_FLAG \\
   || {{ mark_done FAILED_TRAIN; exit 1; }}
-
-# --- 6. upload the core checkpoints (final artifacts -> R2) ---
-# Trained checkpoints exist only on this instance's container disk, and the
-# cleanup trap self-destructs the instance regardless of exit status -- so
-# upload final_fp32/final_bf16 *before* attempting any post-processing
-# (fp16/GGUF conversion below). A conversion failure must never risk losing
-# a completed training run. Retry each upload a few times before giving up.
 upload_with_retry() {{
   for attempt in 1 2 3; do
     if python3 "$REPO/scripts/upload_to_r2.py" --file "$1" --bucket "$R2_BUCKET" --key "$2" --recursive; then
       return 0
     fi
-    echo "upload attempt $attempt for $2 failed, retrying in 30s ..."
+    echo "upload $2 attempt $attempt failed, retrying ..."
     sleep 30
   done
   return 1
 }}
-
 upload_with_retry ./checkpoints/final_fp32 {R2_PREFIX}/final_fp32 \\
   || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
-
 upload_with_retry ./checkpoints/final_bf16 {R2_PREFIX}/final_bf16 \\
   || {{ mark_done FAILED_UPLOAD_MODEL; exit 1; }}
-
-# --- 7. convert fp32 master -> fp16 (for MPS/M4 inference). Failure here is
-#        NOT fatal -- final_fp32/final_bf16 are already safely uploaded above
-#        and are usable on their own. ---
 python3 "$REPO/scripts/convert_model.py" \\
   --master ./checkpoints/final_fp32 \\
   --to fp16 --out ./checkpoints/final_fp16 \\
-  && echo "fp16 conversion succeeded" \\
-  || echo "fp16 conversion failed (final_fp32/final_bf16 still usable). Continuing."
-
+  && echo "fp16 ok" || echo "fp16 failed, continuing"
 if [ -f ./checkpoints/final_fp16/model.safetensors ]; then
   upload_with_retry ./checkpoints/final_fp16 {R2_PREFIX}/final_fp16 || true
-else
-  echo "WARNING: skipping final_fp16 upload -- model.safetensors missing (conversion failed or incomplete)"
 fi
-
-# --- 8. attempt GGUF conversion (may fail for Qwen3-TTS -- see convert_model.py
-#        docstring; failure here does NOT abort the pipeline, since fp32/fp16
-#        checkpoints are already usable for cross-device inference) ---
 for i in 1 2 3; do
   rm -rf ./llama.cpp
   git clone --depth 1 https://github.com/ggml-org/llama.cpp ./llama.cpp 2>/dev/null && break
-  echo "llama.cpp clone attempt $i/3 failed, retrying in $((i*10))s ..."
   sleep $((i*10))
 done
 if [ -f ./llama.cpp/convert_hf_to_gguf.py ]; then
@@ -509,17 +395,11 @@ if [ -f ./llama.cpp/convert_hf_to_gguf.py ]; then
     --master ./checkpoints/final_fp32 \\
     --to gguf --out ./checkpoints/final_gguf \\
     --llama-cpp-dir ./llama.cpp --gguf-outtype f16 \\
-    && echo "GGUF conversion succeeded" \\
-    || echo "GGUF conversion failed (expected for Qwen3-TTS -- fp32/fp16 checkpoints still usable). Continuing."
-else
-  echo "llama.cpp clone failed or convert script missing -- skipping GGUF, continuing."
+    && echo "GGUF ok" || echo "GGUF failed (expected), continuing"
 fi
-
-# Upload GGUF only if it was produced (best-effort, doesn't fail the run)
 if [ -d ./checkpoints/final_gguf ]; then
   upload_with_retry ./checkpoints/final_gguf {R2_PREFIX}/final_gguf || true
 fi
-
 mark_done SUCCESS
 """
     return script
