@@ -182,3 +182,4 @@ cython_debug/
 /_migrate_resampled
 /checkpoints
 *.wav
+/local_work

@@ -259,7 +259,7 @@ def process_pair(pair_name, lang_code, kaldi_dir, out_dir, split):
                 "audio": str(out_path.resolve()),
                 "text": text,
                 "lang": lang_code,
-                "speaker_id": rec_id,
+                "speaker_id": utt_id.split("_")[0],
                 "source": f"slr104_{pair_name}_{split}",
             }
             mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
