@@ -53,44 +53,41 @@ else
 fi
 
 echo "=== 3b/3: Installing flash-attn (optional, faster attention) ==="
-# Builds a CUDA extension from source -- can take 10-20+ minutes and needs
-# nvcc; MAX_JOBS bounds parallel compile jobs to avoid OOM on many-core boxes.
-# Best-effort and non-fatal: without it, qwen_tts just falls back to the
-# manual PyTorch attention path (slower, but already works).
+# Try a pre-built wheel first (no nvcc needed, installs in seconds).
+# Falls back to building from source if no wheel matches the environment.
+# Best-effort and non-fatal.
 pip_retry ninja packaging
 export MAX_JOBS=4
 
-# flash-attn's setup.py needs CUDA_HOME (nvcc + headers) via
-# torch.utils.cpp_extension, which many PyTorch docker images don't set even
-# though the CUDA runtime itself is present. Try, in order: an existing nvcc
-# on PATH, /usr/local/cuda, then a pip-only nvcc matching torch's CUDA build
-# (nvidia-cuda-nvcc-cu12, ~tens of MB).
-if [ -z "${CUDA_HOME:-}" ]; then
-  if command -v nvcc >/dev/null 2>&1; then
-    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
-  elif [ -d /usr/local/cuda ]; then
-    export CUDA_HOME=/usr/local/cuda
-  else
-    pip_retry nvidia-cuda-nvcc-cu12 || true
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
-    NVCC_PATH=$(find "$SITE_PACKAGES/nvidia" -maxdepth 4 -type f -name nvcc 2>/dev/null | head -1)
-    if [ -n "$NVCC_PATH" ]; then
-      export CUDA_HOME="$(dirname "$(dirname "$NVCC_PATH")")"
-      export PATH="$CUDA_HOME/bin:$PATH"
+if pip install -q flash-attn 2>/dev/null; then
+  echo "flash-attn installed (pre-built wheel)"
+else
+  echo "No pre-built wheel found, attempting source build (needs nvcc) ..."
+  if [ -z "${CUDA_HOME:-}" ]; then
+    if command -v nvcc >/dev/null 2>&1; then
+      export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    elif [ -d /usr/local/cuda ]; then
+      export CUDA_HOME=/usr/local/cuda
+    else
+      pip_retry nvidia-cuda-nvcc-cu12 || true
+      SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || true)
+      NVCC_PATH=$(find "$SITE_PACKAGES/nvidia" -maxdepth 4 -type f -name nvcc 2>/dev/null | head -1)
+      if [ -n "$NVCC_PATH" ]; then
+        export CUDA_HOME="$(dirname "$(dirname "$NVCC_PATH")")"
+        export PATH="$CUDA_HOME/bin:$PATH"
+      fi
     fi
   fi
-fi
-
-if [ -n "${CUDA_HOME:-}" ]; then
-  echo "CUDA_HOME=$CUDA_HOME"
-  if timeout 1800 pip install -q flash-attn --no-build-isolation; then
-    echo "flash-attn installed"
+  if [ -n "${CUDA_HOME:-}" ]; then
+    echo "CUDA_HOME=$CUDA_HOME"
+    if timeout 1800 pip install -q flash-attn --no-build-isolation; then
+      echo "flash-attn installed (source build)"
+    else
+      echo "WARNING: flash-attn source build failed or timed out -- continuing without it (slower attention, non-fatal)"
+    fi
   else
-    echo "WARNING: flash-attn install failed or timed out -- continuing without it (slower attention, non-fatal)"
+    echo "WARNING: no pre-built wheel and no nvcc found -- continuing without flash-attn (non-fatal)"
   fi
-else
-  echo "WARNING: no CUDA toolkit (nvcc) found, even via pip fallback -- skipping flash-attn build."
-  echo "  Continuing without it (slower attention, non-fatal)."
 fi
 
 mkdir -p ./data ./models
