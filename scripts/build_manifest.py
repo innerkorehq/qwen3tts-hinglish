@@ -27,6 +27,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
+import re
+import unicodedata
 import numpy as np
 import soundfile as sf
 import librosa
@@ -41,6 +43,46 @@ SNR_MIN_DB = 20.0
 REF_DUR_MIN = 4.0
 REF_DUR_MAX = 10.0
 REF_DUR_TARGET = 7.0
+
+# Devanagari Unicode block (U+0900–U+097F) + Devanagari Extended (U+A8E0–U+A8FF).
+# Also catches Devanagari digits ०-९ (U+0966–U+096F) which are inside the block.
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ꣠-ꣿ]+")
+# Zero-width characters sometimes embedded in Devanagari text.
+_ZWX_RE = re.compile(r"[​-‍﻿]")
+
+
+def normalize_hinglish(text: str) -> str:
+    """Normalize any mix of Devanagari + Roman Hinglish + English to lowercase Roman.
+
+    Strategy:
+    - NFC-normalize so Devanagari matras are composed (prevents split codepoints).
+    - Strip zero-width joiners/non-joiners that confuse ITRANS.
+    - Replace each Devanagari span (word or mid-word) with its ITRANS transliteration.
+    - Lowercase everything: removes ITRANS retroflex caps (T, D, Th, Dh → t, d, th, dh)
+      so the text tokenizer sees only familiar lowercase Latin characters throughout.
+
+    Examples:
+      "कल मेरा interview था"  -> "kal meraa interview thaa"
+      "Kal mera interview tha" -> "kal mera interview tha"
+      "कल mera interview था"  -> "kal mera interview thaa"
+      "मुझे prepare करना है"  -> "mujhe prepare karanaa hai"
+    """
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate as _xlit
+    except ImportError:
+        # indic_transliteration not installed: pass text through unchanged.
+        # bootstrap_vastai.sh installs it; this path only fires in local dev.
+        return text.lower()
+
+    text = unicodedata.normalize("NFC", text)
+    text = _ZWX_RE.sub("", text)
+
+    def _replace(m):
+        return _xlit(m.group(), sanscript.DEVANAGARI, sanscript.ITRANS)
+
+    text = _DEVANAGARI_RE.sub(_replace, text)
+    return text.lower()
 
 
 def estimate_snr(y: np.ndarray, sr: int, frame_ms: int = 20) -> float:
@@ -408,6 +450,7 @@ def main():
             rec_out["audio"] = str(dst.resolve())
             rec_out["duration"] = dur
             rec_out["snr"] = round(snr, 1)
+            rec_out["text"] = normalize_hinglish(rec_out["text"])
             kept.append(rec_out)
             total_dur += dur
             if n_done % 1000 == 0:

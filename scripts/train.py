@@ -182,8 +182,21 @@ def save_checkpoint(unwrapped_model, init_model_path, output_dir, dtype):
     (cast to dtype). Unlike the official reference, no weights are dropped and no
     codec_embedding/spk_id surgery is performed -- the result loads exactly like
     the Base model, with arbitrary --ref_audio at inference.
+
+    LoRA-aware: if unwrapped_model is a PeftModel, deep-copies and merges the
+    adapter into the base weights before saving so the output checkpoint has no
+    peft dependency at inference time.
     """
     from safetensors.torch import save_file
+
+    # Merge LoRA adapter if present so the saved checkpoint is a plain model.
+    try:
+        from peft import PeftModel
+        if isinstance(unwrapped_model, PeftModel):
+            import copy
+            unwrapped_model = copy.deepcopy(unwrapped_model).merge_and_unload()
+    except ImportError:
+        pass
 
     output_dir = Path(output_dir)
     shutil.copytree(init_model_path, output_dir, dirs_exist_ok=True)
@@ -197,6 +210,45 @@ def save_checkpoint(unwrapped_model, init_model_path, output_dir, dtype):
     state_dict = {k: v.detach().to("cpu").to(dtype) for k, v in unwrapped_model.state_dict().items()}
     save_file(state_dict, str(output_dir / "model.safetensors"))
     _clean_config_for_portability(output_dir / "config.json")
+
+
+def _save_lora_state(peft_model, optimizer, lr_scheduler, accel_state_dir):
+    """Save LoRA resume state: adapter weights + optimizer + scheduler + RNG."""
+    import pickle
+    d = Path(accel_state_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    peft_model.save_pretrained(str(d))
+    torch.save(optimizer.state_dict(), str(d / "optimizer.bin"))
+    torch.save(lr_scheduler.state_dict(), str(d / "scheduler.bin"))
+    rng = {"cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        rng["cuda"] = torch.cuda.get_rng_state_all()
+    with open(str(d / "random_states_0.pkl"), "wb") as f:
+        pickle.dump(rng, f)
+
+
+def _load_lora_state(peft_model, optimizer, lr_scheduler, accel_state_dir):
+    """Load LoRA resume state: adapter weights + optimizer + scheduler + RNG."""
+    import pickle
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file as _load_sf
+    d = Path(accel_state_dir)
+    adapter_path = d / "adapter_model.safetensors"
+    if adapter_path.exists():
+        set_peft_model_state_dict(peft_model, _load_sf(str(adapter_path)))
+    opt_path = d / "optimizer.bin"
+    if opt_path.exists():
+        optimizer.load_state_dict(torch.load(str(opt_path), map_location="cpu", weights_only=False))
+    sched_path = d / "scheduler.bin"
+    if sched_path.exists():
+        lr_scheduler.load_state_dict(torch.load(str(sched_path), map_location="cpu", weights_only=False))
+    rng_path = d / "random_states_0.pkl"
+    if rng_path.exists():
+        with open(str(rng_path), "rb") as f:
+            rng = pickle.load(f)
+        torch.set_rng_state(rng["cpu"])
+        if "cuda" in rng and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
 
 
 def main():
@@ -235,6 +287,21 @@ def main():
     )
     config = AutoConfig.from_pretrained(init_model_path)
 
+    lora_cfg = cfg.get("lora", {})
+    lora_enabled = lora_cfg.get("enabled", False)
+    if lora_enabled:
+        from peft import get_peft_model, LoraConfig
+        lora_config = LoraConfig(
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("lora_alpha", 32),
+            target_modules=lora_cfg.get("target_modules",
+                ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+            lora_dropout=lora_cfg.get("dropout", 0.05),
+            bias="none",
+        )
+        qwen3tts.model = get_peft_model(qwen3tts.model, lora_config)
+        qwen3tts.model.print_trainable_parameters()
+
     print("Loading datasets ...")
     train_data = load_jsonl(d["train_jsonl"])
     train_dataset = TTSDataset(train_data, qwen3tts.processor, config)
@@ -260,7 +327,8 @@ def main():
                 collate_fn=eval_dataset.collate_fn,
             )
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=t["lr"], weight_decay=t.get("weight_decay", 0.01))
+    trainable_params = [p for p in qwen3tts.model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=t["lr"], weight_decay=t.get("weight_decay", 0.01))
 
     grad_accum = t["gradient_accumulation_steps"]
     num_epochs = t["num_epochs"]
@@ -291,12 +359,12 @@ def main():
 
     if args.resume and accel_state_dir.exists() and state_path.exists():
         accelerator.print(f"Resuming from {accel_state_dir} ...")
-        accelerator.load_state(str(accel_state_dir))
+        if lora_enabled:
+            _load_lora_state(unwrap_model(model), optimizer, lr_scheduler, accel_state_dir)
+        else:
+            accelerator.load_state(str(accel_state_dir))
 
-        # load_state() restores the optimizer's param_groups (lr, initial_lr)
-        # and the scheduler's base_lrs from the saved run's lr -- so a changed
-        # training.lr in the config would otherwise be silently ignored on
-        # resume. Re-apply the current config's lr now.
+        # Re-apply config lr — load_state/load_lora_state bake in the old lr.
         for group in optimizer.param_groups:
             group["lr"] = t["lr"]
             group["initial_lr"] = t["lr"]
@@ -362,7 +430,10 @@ def main():
                 save_checkpoint(unwrapped_model, init_model_path, str(best_dir), dtype=torch.bfloat16)
 
             accelerator.print(f"  saving resume state -> {accel_state_dir}")
-            accelerator.save_state(str(accel_state_dir))
+            if lora_enabled:
+                _save_lora_state(unwrapped_model, optimizer, lr_scheduler, accel_state_dir)
+            else:
+                accelerator.save_state(str(accel_state_dir))
             with open(state_path, "w") as f:
                 json.dump({
                     "epoch": epoch,

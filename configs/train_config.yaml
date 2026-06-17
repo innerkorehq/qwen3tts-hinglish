@@ -84,6 +84,28 @@ training:
   # --- Reproducibility ---
   seed: 42
 
+lora:
+  # LoRA fine-tuning (recommended over full FT to avoid catastrophic forgetting).
+  # Only ~2-5% of parameters are updated; base weights are frozen, preserving
+  # the base model's English/Roman TTS capability while learning Hinglish.
+  # Disable (enabled: false) to revert to full fine-tune.
+  enabled: true
+  r: 16
+  lora_alpha: 32
+  # Update attention + MLP projections inside the talker transformer.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  dropout: 0.05
+  # At inference, merged LoRA checkpoints (final_fp32/final_bf16/best) are
+  # plain model files with no peft dependency -- load exactly like the Base
+  # model with arbitrary --ref_audio.
+
 # Notes:
 # - Container disk budget: see docs/RUNBOOK.md "Disk budget" for the full
 #   breakdown. Per-epoch checkpoints are NOT accumulated -- only the latest

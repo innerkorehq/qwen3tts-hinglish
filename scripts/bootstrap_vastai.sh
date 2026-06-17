@@ -37,8 +37,8 @@ pip_retry() {
   done
 }
 pip_retry -U pip
-pip_retry qwen-tts transformers accelerate boto3 soundfile librosa \
-  datasets huggingface_hub pydub requests pyyaml
+pip_retry qwen-tts transformers accelerate peft boto3 soundfile librosa \
+  datasets huggingface_hub pydub requests pyyaml indic-transliteration
 
 echo "=== 3a/3: Installing sox ==="
 # librosa/audioread fall back to sox (via subprocess) when soundfile can't
