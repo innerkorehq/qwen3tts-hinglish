@@ -194,15 +194,6 @@ def save_checkpoint(unwrapped_model, init_model_path, output_dir, dtype):
     """
     from safetensors.torch import save_file
 
-    # Merge LoRA adapter if present so the saved checkpoint is a plain model.
-    try:
-        from peft import PeftModel
-        if isinstance(unwrapped_model, PeftModel):
-            import copy
-            unwrapped_model = copy.deepcopy(unwrapped_model).merge_and_unload()
-    except ImportError:
-        pass
-
     output_dir = Path(output_dir)
     shutil.copytree(init_model_path, output_dir, dirs_exist_ok=True)
 
@@ -212,9 +203,28 @@ def save_checkpoint(unwrapped_model, init_model_path, output_dir, dtype):
         for f in output_dir.glob(pattern):
             f.unlink()
 
-    state_dict = {k: v.detach().to("cpu").to(dtype) for k, v in unwrapped_model.state_dict().items()}
+    # LoRA-aware: merge adapter into base weights in-place, save, then unmerge
+    # to restore the factored form for continued training.
+    # Avoids copy.deepcopy which fails on PeftModel (dict_keys not picklable).
+    is_peft = False
+    try:
+        from peft import PeftModel
+        if isinstance(unwrapped_model, PeftModel):
+            is_peft = True
+            unwrapped_model.merge_adapter()
+            state_dict = {k: v.detach().to("cpu").to(dtype)
+                          for k, v in unwrapped_model.base_model.model.state_dict().items()}
+    except ImportError:
+        pass
+
+    if not is_peft:
+        state_dict = {k: v.detach().to("cpu").to(dtype) for k, v in unwrapped_model.state_dict().items()}
+
     save_file(state_dict, str(output_dir / "model.safetensors"))
     _clean_config_for_portability(output_dir / "config.json")
+
+    if is_peft:
+        unwrapped_model.unmerge_adapter()
 
 
 def _save_lora_state(peft_model, optimizer, lr_scheduler, accel_state_dir):
