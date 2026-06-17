@@ -606,7 +606,7 @@ def main():
     ap.add_argument(
         "--slr104-pairs",
         nargs="+",
-        default=["hindi-english", "bengali-english"],
+        default=["hindi-english"],
         choices=["hindi-english", "bengali-english"],
         help="OpenSLR-104 code-switched pairs to download",
     )

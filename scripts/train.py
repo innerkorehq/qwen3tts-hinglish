@@ -148,7 +148,9 @@ def compute_loss(model, batch):
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
 
-    input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+    input_text_embedding = model.talker.text_projection(
+        model.talker.model.text_embedding(input_text_ids)
+    ) * text_embedding_mask
     input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
     input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -159,15 +161,18 @@ def compute_loss(model, batch):
         codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
         input_embeddings = input_embeddings + codec_i_embedding
 
+    # Pass full sequence — HF's ForCausalLMLoss shifts labels internally.
+    # Passing [:, :-1] inputs + labels[:, 1:] would shift twice (double-shift
+    # bug in the original sft_12hz.py, fixed in QwenLM/Qwen3-TTS PR #178).
     outputs = model.talker(
-        inputs_embeds=input_embeddings[:, :-1, :],
-        attention_mask=attention_mask[:, :-1],
-        labels=codec_0_labels[:, 1:],
+        inputs_embeds=input_embeddings,
+        attention_mask=attention_mask,
+        labels=codec_0_labels,
         output_hidden_states=True,
     )
 
     hidden_states = outputs.hidden_states[0][-1]
-    talker_hidden_states = hidden_states[codec_mask[:, :-1]]
+    talker_hidden_states = hidden_states[codec_mask]
     talker_codec_ids = codec_ids[codec_mask]
 
     _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
@@ -280,11 +285,23 @@ def main():
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
     print(f"Loading Qwen3TTSModel from {init_model_path} ...")
-    qwen3tts = Qwen3TTSModel.from_pretrained(
-        init_model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=m.get("attn_implementation", "sdpa"),
-    )
+    attn_impl = m.get("attn_implementation", "sdpa")
+    try:
+        qwen3tts = Qwen3TTSModel.from_pretrained(
+            init_model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=attn_impl,
+        )
+    except Exception:
+        if attn_impl != "sdpa":
+            print(f"WARNING: attn_implementation={attn_impl} failed, falling back to sdpa")
+            qwen3tts = Qwen3TTSModel.from_pretrained(
+                init_model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+        else:
+            raise
     config = AutoConfig.from_pretrained(init_model_path)
 
     lora_cfg = cfg.get("lora", {})

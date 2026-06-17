@@ -26,7 +26,7 @@ model:
   # "flash_attention_2" (used by the official reference) requires the
   # separately-installed `flash-attn` package, which bootstrap_vastai.sh does
   # not install. "sdpa" works out of the box on the A100 image.
-  attn_implementation: sdpa
+  attn_implementation: flash_attention_2
 
 data:
   train_jsonl: ./data/train_with_codes.jsonl
@@ -43,7 +43,7 @@ training:
   # first run rather than restarting. The cosine LR schedule is recomputed for
   # the new total_epochs and "reheats" from where the previous run's schedule
   # ended, decaying to 0 by the new final epoch.
-  num_epochs: 6
+  num_epochs: 10
 
   # --- Batch size ---
   # effective = batch_size x gradient_accumulation_steps = 4 x 8 = 32
@@ -60,7 +60,7 @@ training:
   # 1e-5) and the cosine schedule recomputed for num_epochs=6 reheats from
   # ~0 back to ~0.8x this lr at the current step, then decays to 0 over the
   # remaining epochs.
-  lr: 2.0e-5
+  lr: 2.0e-6
   lr_scheduler_type: cosine
   warmup_ratio: 0.05            # ~595 steps warmup (of ~11,910 total over 6 epochs)
 

@@ -119,12 +119,12 @@ def main():
     ap.add_argument("--out", required=True, help="output wav path")
     ap.add_argument("--device", default="mps", help="torch device: mps, cpu, cuda (default: mps)")
     ap.add_argument("--dtype", default="float16", choices=list(DTYPE_MAP), help="default: float16")
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--max-new-tokens", type=int, default=None)
-    ap.add_argument("--temperature", type=float, default=None)
-    ap.add_argument("--top-k", type=int, default=None)
-    ap.add_argument("--top-p", type=float, default=None)
-    ap.add_argument("--repetition-penalty", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max-new-tokens", type=int, default=2048)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=30)
+    ap.add_argument("--top-p", type=float, default=0.85)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05)
     args = ap.parse_args()
 
     if not args.x_vector_only and not args.ref_text:
