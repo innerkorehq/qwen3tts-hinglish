@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Build a single unified JSONL manifest from HiACC (adult + children) and
-OpenSLR-104 Hindi-English / Bengali-English code-switched transcript files,
+Build a single unified JSONL manifest from HiACC (adult + children),
+OpenSLR-104 Hindi-English, and optionally HuggingFace audio datasets,
 resampling audio to 24kHz mono.
 
 Usage:
@@ -10,6 +10,15 @@ Usage:
         --slr104-dir ./data/raw/slr104 \
         --out ./data/manifest_raw.jsonl \
         --eval-frac 0.02
+
+    # With HF datasets (requires `datasets` package and internet):
+    python3 build_manifest.py \
+        --hiacc-dir ./data/raw/hiacc \
+        --slr104-dir ./data/raw/slr104 \
+        --indic-voices \
+        --hinglish-casual \
+        --hf-raw-dir ./data/raw/hf \
+        --out ./data/manifest_raw.jsonl
 """
 import argparse
 import json
@@ -39,6 +48,9 @@ TARGET_SR = 24000
 MIN_DUR = 2.0
 MAX_DUR = 15.0
 SNR_MIN_DB = 20.0
+
+# Strip paraverbal markers like <sigh>, <chuckle>, <laugh> from hinglish-casual.
+_PARAVERBAL_RE = re.compile(r"<[^>]+>")
 
 REF_DUR_MIN = 4.0
 REF_DUR_MAX = 10.0
@@ -228,6 +240,170 @@ def load_slr104_pairs(slr104_dir: Path):
     return pairs
 
 
+def load_hf_audio_dataset(
+    dataset_name: str,
+    raw_dir: Path,
+    splits=("train",),
+    audio_col: str = "audio",
+    text_col: str = "text",
+    speaker_col: str = None,
+    lang: str = "hinglish",
+    source_name: str = None,
+    text_filter=None,
+    hf_cache_dir: str = None,
+    max_rows: int = None,
+) -> list:
+    """Stream a HuggingFace audio dataset, save raw WAV files, return pairs.
+
+    Each row's audio array is saved as a WAV file under raw_dir/source/.
+    A pairs.jsonl cache is written next to the WAVs so re-runs skip the
+    download entirely (even across machines if raw_dir is on shared storage).
+
+    Args:
+        dataset_name:  HuggingFace dataset id (e.g. "dianavdavidson/indic-voices-...")
+        raw_dir:       root dir to store raw WAV files under raw_dir/source/
+        splits:        HF splits to load, concatenated in order
+        audio_col:     column containing audio (dict with "array"/"sampling_rate")
+        text_col:      column containing transcript text
+        speaker_col:   column containing speaker id (optional)
+        lang:          language tag to write into the manifest record
+        source_name:   override the source field (default: last component of dataset_name)
+        text_filter:   callable(str) -> str applied to each transcript before saving
+        hf_cache_dir:  HF datasets cache directory
+        max_rows:      cap total rows across all splits (None = no cap)
+    """
+    try:
+        from datasets import load_dataset, concatenate_datasets
+    except ImportError:
+        print(f"  WARNING: `datasets` not installed, skipping {dataset_name}")
+        return []
+
+    source = source_name or dataset_name.split("/")[-1].replace("-", "_")
+    out_dir = raw_dir / source
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resume: pairs cache exists → skip download entirely
+    pairs_cache = out_dir / "pairs.jsonl"
+    if pairs_cache.exists():
+        pairs = []
+        with open(pairs_cache) as fh:
+            for line in fh:
+                pairs.append(json.loads(line))
+        print(f"  [{source}] resumed {len(pairs)} pairs from cache")
+        return pairs
+
+    print(f"  [{source}] loading {dataset_name} splits={splits} ...")
+    ds_splits = []
+    for sp in splits:
+        try:
+            ds_splits.append(load_dataset(
+                dataset_name, split=sp,
+                cache_dir=hf_cache_dir,
+                trust_remote_code=True,
+            ))
+        except Exception as e:
+            print(f"  [{source}] WARNING: could not load split '{sp}': {e}")
+    if not ds_splits:
+        return []
+    ds = concatenate_datasets(ds_splits) if len(ds_splits) > 1 else ds_splits[0]
+
+    if max_rows and len(ds) > max_rows:
+        ds = ds.select(range(max_rows))
+        print(f"  [{source}] capped at {max_rows} rows")
+
+    pairs = []
+    n_skip = 0
+    for i, row in enumerate(ds):
+        audio_info = row.get(audio_col)
+        if not audio_info:
+            n_skip += 1
+            continue
+
+        text = str(row.get(text_col, "") or "").strip()
+        if text_filter:
+            text = text_filter(text)
+        text = text.strip()
+        if not text:
+            n_skip += 1
+            continue
+
+        spk = str(row[speaker_col]) if speaker_col and speaker_col in row else f"{source}_{i:06d}"
+
+        audio_path = out_dir / f"{i:08d}.wav"
+        if not audio_path.exists():
+            try:
+                arr = np.array(audio_info["array"], dtype=np.float32)
+                sr = int(audio_info["sampling_rate"])
+                sf.write(str(audio_path), arr, sr)
+            except Exception as e:
+                print(f"  [{source}] skipping row {i}: {e}")
+                n_skip += 1
+                continue
+
+        pairs.append({
+            "audio": str(audio_path),
+            "text": text,
+            "lang": lang,
+            "speaker_id": spk,
+            "source": source,
+        })
+
+        if (i + 1) % 10000 == 0:
+            print(f"  [{source}] {i+1}/{len(ds)} rows, {len(pairs)} kept ...")
+
+    # Write cache so re-runs skip the download
+    with open(pairs_cache, "w") as fh:
+        for p in pairs:
+            fh.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    print(f"  [{source}] done: {len(pairs)} pairs ({n_skip} skipped) -> {out_dir}")
+    return pairs
+
+
+def load_indic_voices_pairs(raw_dir: Path, hf_cache_dir: str = None, max_rows: int = 100_000) -> list:
+    """Load dianavdavidson/indic-voices-hinglish-nospeakeroverlap-spon.
+
+    Uses 'normalized' text (cleaner than verbatim). Loads train + validation.
+    max_rows caps the total across both splits (default 100k).
+    """
+    return load_hf_audio_dataset(
+        dataset_name="dianavdavidson/indic-voices-hinglish-nospeakeroverlap-spon",
+        raw_dir=raw_dir,
+        splits=("train", "validation"),
+        audio_col="audio",
+        text_col="normalized",
+        speaker_col="speaker_id",
+        lang="hinglish",
+        source_name="indic_voices",
+        hf_cache_dir=hf_cache_dir,
+        max_rows=max_rows,
+    )
+
+
+def load_hinglish_casual_pairs(raw_dir: Path, hf_cache_dir: str = None) -> list:
+    """Load tiny-aya-translate/hinglish-casual.
+
+    Uses 'utterance_latin' (already romanized). Strips paraverbal markers.
+    7 named speakers.
+    """
+    def _clean(text: str) -> str:
+        text = _PARAVERBAL_RE.sub("", text)
+        return " ".join(text.split())
+
+    return load_hf_audio_dataset(
+        dataset_name="tiny-aya-translate/hinglish-casual",
+        raw_dir=raw_dir,
+        splits=("train",),
+        audio_col="audio",
+        text_col="utterance_latin",
+        speaker_col="speaker",
+        lang="hinglish",
+        source_name="hinglish_casual",
+        text_filter=_clean,
+        hf_cache_dir=hf_cache_dir,
+    )
+
+
 def _stats(values):
     if not values:
         return {}
@@ -374,8 +550,15 @@ def print_analytics(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hiacc-dir", required=True)
-    ap.add_argument("--slr104-dir", required=True)
+    ap.add_argument("--hiacc-dir", default=None,
+                    help="extracted HiACC Corpus/ directory (optional if --base-manifest provided)")
+    ap.add_argument("--slr104-dir", default=None,
+                    help="OpenSLR-104 output directory (optional if --base-manifest provided)")
+    ap.add_argument("--base-manifest", default=None,
+                    help="existing train manifest JSONL to load as a starting point "
+                         "(both train and paired eval file are loaded; only new sources are processed). "
+                         "Use when resuming: existing resampled audio is already present, "
+                         "only HF datasets need to be added.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--resampled-dir", default="./data/resampled",
                     help="where to write 24kHz mono copies")
@@ -385,26 +568,77 @@ def main():
                     help="parallel resampling workers (default: all CPUs)")
     ap.add_argument("--min-snr", type=float, default=SNR_MIN_DB,
                     help="drop clips with estimated SNR below this dB threshold (default: %(default)s)")
+    # HuggingFace dataset flags
+    ap.add_argument("--indic-voices", action="store_true",
+                    help="include dianavdavidson/indic-voices-hinglish-nospeakeroverlap-spon")
+    ap.add_argument("--indic-voices-max-rows", type=int, default=100_000,
+                    help="cap on indic-voices rows across train+val (default: 100000)")
+    ap.add_argument("--hinglish-casual", action="store_true",
+                    help="include tiny-aya-translate/hinglish-casual")
+    ap.add_argument("--hf-raw-dir", default="./data/raw/hf",
+                    help="directory for raw WAV files saved from HF datasets (default: ./data/raw/hf)")
+    ap.add_argument("--hf-cache-dir", default=None,
+                    help="HuggingFace datasets cache directory (default: ~/.cache/huggingface)")
     args = ap.parse_args()
 
-    hiacc_dir = Path(args.hiacc_dir)
-    slr104_dir = Path(args.slr104_dir)
+    hiacc_dir = Path(args.hiacc_dir) if args.hiacc_dir else None
+    slr104_dir = Path(args.slr104_dir) if args.slr104_dir else None
+    hf_raw_dir = Path(args.hf_raw_dir)
     resampled_dir = Path(args.resampled_dir)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Scanning HiACC ...")
-    hiacc_pairs = find_hiacc_pairs(hiacc_dir)
-    print(f"  -> {len(hiacc_pairs)} pairs")
+    # Load pre-existing records from a previous run (already resampled + filtered).
+    # These are passed through without re-resampling; only new sources are processed below.
+    base_kept = []
+    if args.base_manifest:
+        base_path = Path(args.base_manifest)
+        eval_stem = base_path.stem.replace("_raw", "") + "_eval_raw.jsonl"
+        eval_path = base_path.with_name(eval_stem)
+        for p in [base_path, eval_path]:
+            if p.exists():
+                with open(p) as fh:
+                    for line in fh:
+                        base_kept.append(json.loads(line))
+        print(f"Loaded {len(base_kept)} records from base manifest (will be kept as-is)")
 
-    print("Scanning OpenSLR-104 (Hindi-English / Bengali-English) ...")
-    slr104_pairs = load_slr104_pairs(slr104_dir)
-    print(f"  -> {len(slr104_pairs)} pairs")
+    all_pairs = []
+    if hiacc_dir and hiacc_dir.exists():
+        print("Scanning HiACC ...")
+        hiacc_pairs = find_hiacc_pairs(hiacc_dir)
+        print(f"  -> {len(hiacc_pairs)} pairs")
+        all_pairs += hiacc_pairs
+    elif not args.base_manifest:
+        print("WARNING: --hiacc-dir not provided and no --base-manifest; skipping HiACC")
 
-    all_pairs = hiacc_pairs + slr104_pairs
-    print(f"\nTotal raw pairs: {len(all_pairs)}")
+    if slr104_dir and slr104_dir.exists():
+        print("Scanning OpenSLR-104 (Hindi-English) ...")
+        slr104_pairs = load_slr104_pairs(slr104_dir)
+        print(f"  -> {len(slr104_pairs)} pairs")
+        all_pairs += slr104_pairs
+    elif not args.base_manifest:
+        print("WARNING: --slr104-dir not provided and no --base-manifest; skipping SLR104")
 
-    if not all_pairs:
+    if args.indic_voices:
+        print("Loading indic-voices from HuggingFace ...")
+        iv_pairs = load_indic_voices_pairs(
+            hf_raw_dir, hf_cache_dir=args.hf_cache_dir,
+            max_rows=args.indic_voices_max_rows,
+        )
+        print(f"  -> {len(iv_pairs)} pairs")
+        all_pairs += iv_pairs
+
+    if args.hinglish_casual:
+        print("Loading hinglish-casual from HuggingFace ...")
+        hc_pairs = load_hinglish_casual_pairs(hf_raw_dir, hf_cache_dir=args.hf_cache_dir)
+        print(f"  -> {len(hc_pairs)} pairs")
+        all_pairs += hc_pairs
+
+    print(f"\nTotal raw pairs (new sources): {len(all_pairs)}")
+    if base_kept:
+        print(f"Total base records (from --base-manifest): {len(base_kept)}")
+
+    if not all_pairs and not base_kept:
         raise SystemExit("No pairs found at all — check input directories before continuing.")
 
     print("Resampling to 24kHz mono and filtering by duration ...")
@@ -419,6 +653,8 @@ def main():
         tasks.append((i, str(src), str(dst)))
     if n_missing:
         print(f"  skipping {n_missing} records with missing source audio")
+    if not tasks:
+        print("  no new pairs to resample (all records from --base-manifest)")
 
     print(f"  resampling {len(tasks)} files using {args.workers} worker processes "
           f"(files already present in --resampled-dir, e.g. from a --resume R2 "
@@ -431,7 +667,7 @@ def main():
     n_dur_filtered = 0
     n_snr_filtered = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        for i, dur, snr, err in ex.map(_resample_task, tasks, chunksize=32):
+        for i, dur, snr, err in (ex.map(_resample_task, tasks, chunksize=32) if tasks else []):
             n_done += 1
             if err is not None:
                 n_errors += 1
@@ -458,15 +694,12 @@ def main():
                       f"dur_filtered {n_dur_filtered}, snr_filtered {n_snr_filtered}, "
                       f"{total_dur/3600:.2f}hrs")
 
-    print(f"\nKept {len(kept)} clips, total {total_dur/3600:.2f} hours")
+    print(f"\nKept {len(kept)} new clips, total {total_dur/3600:.2f} hours")
     print(f"Filtered: {n_dur_filtered} by duration, {n_snr_filtered} by SNR (<{args.min_snr}dB), "
           f"{n_errors} errors")
 
-    # Assign ref_audio: for each clip, pick a different utterance from the same
-    # speaker. Prefer clips in REF_DUR_MIN..REF_DUR_MAX (4-10s) so the speaker
-    # encoder gets enough phoneme diversity without noise accumulation. If no
-    # candidate falls in that range, pick the one closest to REF_DUR_TARGET (7s).
-    # Falls back to self-reference only for single-clip speakers.
+    # Assign ref_audio for NEW records only (base_kept records already have it set).
+    # Use only each new record's own speaker pool to avoid cross-corpus ref_audio.
     from collections import defaultdict
     speaker_clips = defaultdict(list)
     for rec in kept:
@@ -489,15 +722,19 @@ def main():
         else:
             rec["ref_audio"] = min(candidates, key=lambda x: abs(x[1] - REF_DUR_TARGET))[0]
 
-    print(f"ref_audio: {n_in_range} in {REF_DUR_MIN}-{REF_DUR_MAX}s range, "
-          f"{len(kept) - n_self_ref - n_in_range} nearest-to-{REF_DUR_TARGET}s fallback, "
-          f"{n_self_ref} self-reference (single-clip speakers)")
+    if kept:
+        print(f"ref_audio (new records): {n_in_range} in {REF_DUR_MIN}-{REF_DUR_MAX}s range, "
+              f"{len(kept) - n_self_ref - n_in_range} nearest-to-{REF_DUR_TARGET}s fallback, "
+              f"{n_self_ref} self-reference (single-clip speakers)")
 
+    # Merge base records with new records and re-shuffle/re-split.
+    # Base records are not re-normalized or re-assigned ref_audio.
+    all_kept = base_kept + kept
     random.seed(args.seed)
-    random.shuffle(kept)
-    n_eval = max(1, int(len(kept) * args.eval_frac))
-    eval_set = kept[:n_eval]
-    train_set = kept[n_eval:]
+    random.shuffle(all_kept)
+    n_eval = max(1, int(len(all_kept) * args.eval_frac))
+    eval_set = all_kept[:n_eval]
+    train_set = all_kept[n_eval:]
 
     with open(out_path, "w") as f:
         for rec in train_set:

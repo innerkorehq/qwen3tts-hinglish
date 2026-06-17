@@ -212,8 +212,17 @@ def save_checkpoint(unwrapped_model, init_model_path, output_dir, dtype):
         if isinstance(unwrapped_model, PeftModel):
             is_peft = True
             unwrapped_model.merge_adapter()
-            state_dict = {k: v.detach().to("cpu").to(dtype)
-                          for k, v in unwrapped_model.base_model.model.state_dict().items()}
+            # After merge_adapter(), PEFT still stores weights under PEFT-wrapped
+            # key names (e.g. q_proj.base_layer.weight, q_proj.lora_A.default.weight).
+            # qwen_tts expects plain keys (q_proj.weight). Strip .base_layer and
+            # drop lora_A / lora_B / lora_embedding entries entirely.
+            raw_sd = unwrapped_model.base_model.model.state_dict()
+            state_dict = {}
+            for k, v in raw_sd.items():
+                if ".lora_A." in k or ".lora_B." in k or ".lora_embedding" in k:
+                    continue
+                clean_k = k.replace(".base_layer.weight", ".weight").replace(".base_layer.bias", ".bias")
+                state_dict[clean_k] = v.detach().to("cpu").to(dtype)
     except ImportError:
         pass
 

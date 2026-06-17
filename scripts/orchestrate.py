@@ -143,7 +143,9 @@ def search_offers(
     return offers
 
 
-def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=False):
+def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=False,
+                         indic_voices=False, indic_voices_max_rows=100_000,
+                         hinglish_casual=False):
     """
     Generates the bash script that runs entirely on the remote instance via
     --onstart-cmd. Full pipeline, all on the instance's container disk under
@@ -207,6 +209,9 @@ def build_onstart_script(slr104_pairs, slr104_include_test, eval_frac, resume=Fa
     SLR104_TEST_ARG = "--include-test" if slr104_include_test else ""
     EVAL_FRAC = eval_frac
     RESUME = "1" if resume else "0"
+    INDIC_VOICES_ARG = f"--indic-voices --indic-voices-max-rows {indic_voices_max_rows}" if indic_voices else ""
+    HINGLISH_CASUAL_ARG = "--hinglish-casual" if hinglish_casual else ""
+    HAS_HF_DATASETS = "1" if (indic_voices or hinglish_casual) else "0"
 
     script = f"""#!/bin/bash
 set -uo pipefail
@@ -312,6 +317,29 @@ else
       --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
       --key-prefix {R2_PREFIX}/resampled_shards \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+    if [ "{HAS_HF_DATASETS}" = "1" ]; then
+      echo "--resume + HF datasets: appending new HF data to existing manifest"
+      python3 "$REPO/scripts/build_manifest.py" \\
+        --base-manifest ./data/manifest_raw.jsonl \\
+        --out ./data/manifest_raw.jsonl \\
+        --resampled-dir ./data/resampled \\
+        --hf-raw-dir ./data/raw/hf \\
+        --eval-frac {EVAL_FRAC} \\
+        {INDIC_VOICES_ARG} \\
+        {HINGLISH_CASUAL_ARG} \\
+        || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+      if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
+        mark_done FAILED_BUILD_MANIFEST; exit 1
+      fi
+      python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_raw.jsonl --bucket "$R2_BUCKET" \\
+        --key {R2_PREFIX}/manifest_raw.jsonl
+      python3 "$REPO/scripts/upload_to_r2.py" --file ./data/manifest_eval_raw.jsonl --bucket "$R2_BUCKET" \\
+        --key {R2_PREFIX}/manifest_eval_raw.jsonl
+      python3 "$REPO/scripts/shard_tar.py" upload --src-dir ./data/resampled \\
+        --work-dir ./data/_shards --bucket "$R2_BUCKET" \\
+        --key-prefix {R2_PREFIX}/resampled_shards --arcname resampled --shard-size-mb 1024 \\
+        || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
+    fi
   elif [ "$RESUME_TAR" = "1" ]; then
     echo "--resume: downloading resampled.tar"
     python3 "$REPO/scripts/upload_to_r2.py" --download --bucket "$R2_BUCKET" \\
@@ -338,7 +366,10 @@ else
       --slr104-dir ./data/raw/slr104 \\
       --out ./data/manifest_raw.jsonl \\
       --resampled-dir ./data/resampled \\
+      --hf-raw-dir ./data/raw/hf \\
       --eval-frac {EVAL_FRAC} \\
+      {INDIC_VOICES_ARG} \\
+      {HINGLISH_CASUAL_ARG} \\
       || {{ mark_done FAILED_BUILD_MANIFEST; exit 1; }}
     if [ ! -f ./data/manifest_eval_raw.jsonl ]; then
       mark_done FAILED_BUILD_MANIFEST; exit 1
@@ -557,9 +588,10 @@ def main():
         "--disk",
         type=int,
         default=250,
-        help="container disk size in GB (default 250 -- see "
-        "docs/RUNBOOK.md 'Disk budget' for the breakdown; "
-        "steady-state ~144GB, peak transient ~160GB)",
+        help="container disk size in GB (default 250 for base datasets; "
+        "use 400 when adding --indic-voices or --hinglish-casual -- "
+        "each adds ~30-50GB of raw + resampled audio; see "
+        "docs/RUNBOOK.md 'Disk budget')",
     )
     ap.add_argument(
         "--gpu",
@@ -620,6 +652,25 @@ def main():
         type=float,
         default=0.02,
         help="fraction of combined dataset held out for eval",
+    )
+    ap.add_argument(
+        "--indic-voices",
+        action="store_true",
+        help="include dianavdavidson/indic-voices-hinglish-nospeakeroverlap-spon "
+        "(downloads ~100k clips from HuggingFace; adds ~50-70 hours; requires "
+        "extra ~30GB disk; downloads automatically on the instance)",
+    )
+    ap.add_argument(
+        "--indic-voices-max-rows",
+        type=int,
+        default=100_000,
+        help="cap on indic-voices rows across train+val splits (default 100000)",
+    )
+    ap.add_argument(
+        "--hinglish-casual",
+        action="store_true",
+        help="include tiny-aya-translate/hinglish-casual "
+        "(33k clips from HuggingFace; adds ~37 hours; requires extra ~13GB disk)",
     )
     ap.add_argument(
         "--resume",
@@ -705,6 +756,9 @@ def main():
                 slr104_include_test=args.slr104_include_test,
                 eval_frac=args.eval_frac,
                 resume=args.resume,
+                indic_voices=args.indic_voices,
+                indic_voices_max_rows=args.indic_voices_max_rows,
+                hinglish_casual=args.hinglish_casual,
             )
         )
         print(f"\\nGenerated onstart script -> {onstart_path}")

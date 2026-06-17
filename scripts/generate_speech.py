@@ -43,11 +43,15 @@ import argparse
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 # Some ops in the TTS codec/talker may not have MPS kernels yet -- fall back
 # to CPU for those instead of crashing. Must be set before torch is imported.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# Suppress SyntaxWarnings from pydub's regex strings (bugs in pydub, not ours).
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
 
 import torch  # noqa: E402
 
@@ -80,16 +84,18 @@ def resolve_checkpoint(checkpoint_name: str, cache_dir: Path) -> str:
     return str(local_dir)
 
 
-def load_reference_audio(path: str) -> str:
-    """Return a path librosa/soundfile can read, converting via pydub/ffmpeg
-    first if needed (m4a and other compressed formats often aren't readable
-    by soundfile's libsndfile backend directly)."""
-    import librosa
+_SOUNDFILE_NATIVE = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".au", ".snd", ".w64", ".rf64"}
 
-    try:
-        librosa.load(path, sr=None, duration=0.05)
-        return path
-    except Exception:
+
+def load_reference_audio(path: str) -> str:
+    """Return a wav path that soundfile/libsndfile can read natively.
+
+    Compressed formats (m4a, mp3, mp4, aac, …) are converted via pydub/ffmpeg
+    upfront so neither our code nor qwen_tts internals trigger the librosa
+    audioread fallback (deprecated since 0.10, removed in 1.0).
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix not in _SOUNDFILE_NATIVE:
         from pydub import AudioSegment
 
         audio = AudioSegment.from_file(path)
@@ -97,6 +103,7 @@ def load_reference_audio(path: str) -> str:
         audio.export(tmp.name, format="wav")
         tmp.close()
         return tmp.name
+    return path
 
 
 def main():
@@ -120,10 +127,14 @@ def main():
     ap.add_argument("--device", default="mps", help="torch device: mps, cpu, cuda (default: mps)")
     ap.add_argument("--dtype", default="float16", choices=list(DTYPE_MAP), help="default: float16")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--max-new-tokens", type=int, default=2048)
-    ap.add_argument("--temperature", type=float, default=0.8)
-    ap.add_argument("--top-k", type=int, default=30)
-    ap.add_argument("--top-p", type=float, default=0.85)
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="hard cap on codec tokens. Default: auto (3 tokens/char, min 150, max 800).")
+    ap.add_argument("--min-new-tokens", type=int, default=None,
+                    help="minimum codec tokens before EOS is allowed. Default: auto (1 token/char, "
+                         "min 24). Prevents the model from collapsing to near-silence.")
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--repetition-penalty", type=float, default=1.05)
     args = ap.parse_args()
 
@@ -132,6 +143,20 @@ def main():
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
+
+    # Auto max_new_tokens: 12Hz codec, ~150 wpm ≈ 2.5 words/sec ≈ 12 tokens/sec.
+    # ~5 chars/word → ~2.4 tokens/char. 3× safety margin, clamped to [150, 800].
+    if args.max_new_tokens is None:
+        auto_tokens = max(150, min(len(args.text) * 3, 800))
+        args.max_new_tokens = auto_tokens
+        print(f"[auto] max_new_tokens={auto_tokens} (~{auto_tokens/12:.0f}s cap)")
+
+    # Auto min_new_tokens: 1 token/char, min 24 (=2s). Stops the model from
+    # predicting EOS on the first few tokens when LoRA over-learned early stopping.
+    if args.min_new_tokens is None:
+        auto_min = max(24, len(args.text) * 1)
+        args.min_new_tokens = auto_min
+        print(f"[auto] min_new_tokens={auto_min} (~{auto_min/12:.0f}s floor)")
 
     from qwen_tts import Qwen3TTSModel
 
@@ -143,6 +168,17 @@ def main():
         device_map=args.device,
         dtype=DTYPE_MAP[args.dtype],
     )
+
+    # qwen_tts hardcodes min_new_tokens=2 inside model.generate()'s talker_kwargs,
+    # so our --min-new-tokens is silently ignored. Patch at the talker level to
+    # intercept and raise that floor to our desired value.
+    _orig_talker_gen = tts.model.talker.generate
+    _user_min = args.min_new_tokens
+
+    def _talker_gen_with_min(*a, min_new_tokens=2, **kw):
+        return _orig_talker_gen(*a, min_new_tokens=max(min_new_tokens, _user_min), **kw)
+
+    tts.model.talker.generate = _talker_gen_with_min
 
     ref_audio_path = load_reference_audio(args.ref_audio)
 
