@@ -171,12 +171,27 @@ def main():
 
     # qwen_tts hardcodes min_new_tokens=2 inside model.generate()'s talker_kwargs,
     # so our --min-new-tokens is silently ignored. Patch at the talker level to
-    # intercept and raise that floor to our desired value.
+    # intercept and raise that floor to our desired value, and to ensure the full
+    # set of codec + text EOS token IDs are active (prevents the ~0.5% infinite
+    # generation failure mode where the model never terminates).
     _orig_talker_gen = tts.model.talker.generate
     _user_min = args.min_new_tokens
 
-    def _talker_gen_with_min(*a, min_new_tokens=2, **kw):
-        return _orig_talker_gen(*a, min_new_tokens=max(min_new_tokens, _user_min), **kw)
+    try:
+        _codec_eos = int(tts.model.config.talker_config.codec_eos_token_id)
+        _eos_ids = sorted({_codec_eos, 151643, 151645, 151670, 151673})
+    except Exception:
+        # Fallback to known Qwen3-TTS codec + text EOS token IDs.
+        _eos_ids = [2150, 2157, 151643, 151645, 151670, 151673]
+    print(f"[eos] using eos_token_id={_eos_ids}")
+
+    def _talker_gen_with_min(*a, min_new_tokens=2, eos_token_id=None, **kw):
+        return _orig_talker_gen(
+            *a,
+            min_new_tokens=max(min_new_tokens, _user_min),
+            eos_token_id=eos_token_id if eos_token_id is not None else _eos_ids,
+            **kw,
+        )
 
     tts.model.talker.generate = _talker_gen_with_min
 

@@ -43,7 +43,7 @@ training:
   # first run rather than restarting. The cosine LR schedule is recomputed for
   # the new total_epochs and "reheats" from where the previous run's schedule
   # ended, decaying to 0 by the new final epoch.
-  num_epochs: 10
+  num_epochs: 20
 
   # --- Batch size ---
   # effective = batch_size x gradient_accumulation_steps = 4 x 8 = 32
@@ -62,7 +62,7 @@ training:
   # remaining epochs.
   lr: 2.0e-6
   lr_scheduler_type: cosine
-  warmup_ratio: 0.05            # ~595 steps warmup (of ~11,910 total over 6 epochs)
+  warmup_ratio: 0.05            # ~5% warmup over total steps
 
   # --- Regularization ---
   weight_decay: 0.01
